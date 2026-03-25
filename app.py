@@ -979,23 +979,31 @@ def parse_time_to_maturity(value: object) -> float:
 def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     parser = TextExtractingHTMLParser()
     parser.feed(html)
-    text = "\n".join(parser.parts)
-
-    row_pattern = re.compile(
-        r"(?P<epic>[A-Z0-9]+)\s+.*?\s+(?P<maturity>\d+\s+years?(?:\s+\d+\s+days?)?)\s+£.*?(?P<real_yield>-?\d+(?:\.\d+)?)%",
-        flags=re.IGNORECASE,
-    )
-    matches = list(row_pattern.finditer(text))
-    if not matches:
-        raise ValueError("DividendData fallback text parser could not find index-linked gilt rows.")
-
+    tokens = [p.strip() for p in parser.parts if str(p).strip()]
     rows = []
-    for match in matches:
-        maturity_text = match.group("maturity")
-        real_yield = pd.to_numeric(match.group("real_yield"), errors="coerce")
+    epic_pattern = re.compile(r"^[A-Z0-9]{2,6}$")
+    percent_pattern = re.compile(r"^-?\d+(?:\.\d+)?%$")
+
+    for idx, token in enumerate(tokens):
+        if not epic_pattern.match(token):
+            continue
+
+        lookahead = tokens[idx : idx + 12]
+        maturity_text = next((t for t in lookahead if re.search(r"\d+\s+year", t, flags=re.IGNORECASE)), None)
+        if maturity_text is None:
+            continue
+
+        maturity_pos = lookahead.index(maturity_text)
+        percent_tokens = [t for t in lookahead[maturity_pos + 1 :] if percent_pattern.match(t)]
+        if not percent_tokens:
+            continue
+
+        real_yield_text = percent_tokens[-1]
+        real_yield = pd.to_numeric(real_yield_text.replace("%", ""), errors="coerce")
         maturity_years = parse_time_to_maturity(maturity_text)
         if pd.isna(real_yield) or pd.isna(maturity_years):
             continue
+
         rows.append(
             {
                 "maturity_years": maturity_years,
@@ -1003,12 +1011,14 @@ def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFr
                 "curve_type": "Real",
                 "curve_date": pd.Timestamp.today().normalize(),
                 "source": "DividendData",
-                "epic": match.group("epic"),
+                "epic": token,
                 "time_to_maturity": maturity_text,
-                "real_yield_raw": f"{match.group('real_yield')}%",
+                "real_yield_raw": real_yield_text,
             }
         )
 
+    if not rows:
+        raise ValueError("DividendData fallback text parser could not find index-linked gilt rows.")
     out = pd.DataFrame(rows).dropna(subset=["maturity_years", "yield_percent"])
     out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
     preview = out[["epic", "time_to_maturity", "real_yield_raw", "maturity_years", "yield_percent", "source"]].copy()
@@ -1153,13 +1163,18 @@ def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tu
         nominal_points["source"] = "BOE"
         real_points["source"] = "BOE"
 
-        extension_points, extension_preview = fetch_dividenddata_real_yield_extension(dividenddata_url)
+        extension_error = None
+        extension_preview = pd.DataFrame()
         short_real_extension = pd.DataFrame(columns=real_points.columns)
-        if not real_points.empty and not extension_points.empty:
-            real_min_maturity = float(real_points["maturity_years"].min())
-            short_real_extension = extension_points[extension_points["maturity_years"] < real_min_maturity].copy()
-            if not short_real_extension.empty:
-                short_real_extension["curve_date"] = real_date
+        try:
+            extension_points, extension_preview = fetch_dividenddata_real_yield_extension(dividenddata_url)
+            if not real_points.empty and not extension_points.empty:
+                real_min_maturity = float(real_points["maturity_years"].min())
+                short_real_extension = extension_points[extension_points["maturity_years"] < real_min_maturity].copy()
+                if not short_real_extension.empty:
+                    short_real_extension["curve_date"] = real_date
+        except Exception as exc:
+            extension_error = f"{type(exc).__name__}: {exc}"
 
         real_combined = pd.concat([short_real_extension, real_points], ignore_index=True)
         real_combined = real_combined.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="last")
@@ -1176,11 +1191,13 @@ def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tu
                 {"metric": "Real workbook", "value": real_member},
                 {"metric": "Real latest date", "value": format_diag_date(real_date)},
                 {"metric": "Real points", "value": int(len(real_points))},
+                {"metric": "Real extension status", "value": "OK" if extension_error is None else "Failed"},
                 {"metric": "Real extension points", "value": int(len(short_real_extension))},
                 {
                     "metric": "Real extension max maturity",
                     "value": "-" if short_real_extension.empty else round(float(short_real_extension["maturity_years"].max()), 3),
                 },
+                {"metric": "Real extension error", "value": "-" if extension_error is None else extension_error},
             ]
         )
         preview = pd.concat([nominal_preview.tail(10), real_preview.tail(10), extension_preview.head(10)], ignore_index=True)
