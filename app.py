@@ -1017,24 +1017,42 @@ def fetch_dividenddata_real_yield_extension(page_url: str) -> tuple[pd.DataFrame
     parser.feed(html)
 
     target_rows = None
+    header = None
     maturity_idx = None
     real_yield_idx = None
     for table_rows in parser.tables:
-        if not table_rows:
+        if len(table_rows) < 3:
             continue
-        header = [str(x).strip() for x in table_rows[0]]
-        header_lookup = {col.lower(): idx for idx, col in enumerate(header)}
-        maturity_idx = next((idx for col, idx in header_lookup.items() if "time to maturity" in col), None)
-        real_yield_idx = next((idx for col, idx in header_lookup.items() if "real yield" in col), None)
-        if maturity_idx is not None and real_yield_idx is not None:
-            target_rows = table_rows
+        max_cols = max(len(r) for r in table_rows[:3])
+        candidate_headers = []
+        for depth in (1, 2, 3):
+            rows_to_merge = table_rows[:depth]
+            merged = []
+            for col_idx in range(max_cols):
+                parts = []
+                for row in rows_to_merge:
+                    if col_idx < len(row):
+                        cell = str(row[col_idx]).strip()
+                        if cell:
+                            parts.append(cell)
+                merged.append(" ".join(parts).strip())
+            candidate_headers.append((depth, merged))
+
+        for depth, merged_header in candidate_headers:
+            header_lookup = {col.lower(): idx for idx, col in enumerate(merged_header)}
+            maturity_idx = next((idx for col, idx in header_lookup.items() if "time to maturity" in col), None)
+            real_yield_idx = next((idx for col, idx in header_lookup.items() if "real yield" in col), None)
+            if maturity_idx is not None and real_yield_idx is not None:
+                target_rows = table_rows[depth:]
+                header = merged_header
+                break
+        if target_rows is not None:
             break
 
-    if not target_rows or maturity_idx is None or real_yield_idx is None:
+    if not target_rows or header is None or maturity_idx is None or real_yield_idx is None:
         raise ValueError("DividendData table with 'Time to Maturity' and 'Real Yield' columns was not found.")
 
-    header = target_rows[0]
-    body = target_rows[1:]
+    body = target_rows
     table = pd.DataFrame(body, columns=header)
     maturity_col = header[maturity_idx]
     real_yield_col = header[real_yield_idx]
