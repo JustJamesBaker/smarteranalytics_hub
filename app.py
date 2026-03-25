@@ -984,16 +984,41 @@ def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFr
     epic_pattern = re.compile(r"^[A-Z0-9]{2,6}$")
     percent_pattern = re.compile(r"^-?\d+(?:\.\d+)?%$")
 
+    def extract_maturity_text(window: list[str]) -> str | None:
+        for i, tok in enumerate(window):
+            low = tok.lower()
+            if re.fullmatch(r"\d+(?:\.\d+)?", tok):
+                if i + 1 < len(window) and window[i + 1].lower().startswith("year"):
+                    maturity = f"{tok} {window[i + 1]}"
+                    if i + 3 < len(window) and re.fullmatch(r"\d+(?:\.\d+)?", window[i + 2]) and window[i + 3].lower().startswith("day"):
+                        maturity += f" {window[i + 2]} {window[i + 3]}"
+                    elif i + 3 < len(window) and re.fullmatch(r"\d+(?:\.\d+)?", window[i + 2]) and window[i + 3].lower().startswith("month"):
+                        maturity += f" {window[i + 2]} {window[i + 3]}"
+                    return maturity
+            if "year" in low:
+                parts = [tok]
+                if i + 2 < len(window) and re.fullmatch(r"\d+(?:\.\d+)?", window[i + 1]) and (
+                    window[i + 2].lower().startswith("day") or window[i + 2].lower().startswith("month")
+                ):
+                    parts.extend([window[i + 1], window[i + 2]])
+                return " ".join(parts)
+        return None
+
     for idx, token in enumerate(tokens):
         if not epic_pattern.match(token):
             continue
 
-        lookahead = tokens[idx : idx + 12]
-        maturity_text = next((t for t in lookahead if re.search(r"\d+\s+year", t, flags=re.IGNORECASE)), None)
+        lookahead = tokens[idx : idx + 40]
+        maturity_text = extract_maturity_text(lookahead)
         if maturity_text is None:
             continue
 
-        maturity_pos = lookahead.index(maturity_text)
+        maturity_pos = 0
+        for j, t in enumerate(lookahead):
+            if maturity_text.startswith(t) or t in maturity_text:
+                maturity_pos = j
+                break
+
         percent_tokens = [t for t in lookahead[maturity_pos + 1 :] if percent_pattern.match(t)]
         if not percent_tokens:
             continue
@@ -1018,7 +1043,34 @@ def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFr
         )
 
     if not rows:
-        raise ValueError("DividendData fallback text parser could not find index-linked gilt rows.")
+        joined_text = " ".join(tokens)
+        regex_rows = []
+        row_pattern = re.compile(
+            r"\b(?P<epic>[A-Z0-9]{2,6})\b.*?(?P<maturity>\d+(?:\.\d+)?\s+years?(?:\s+\d+(?:\.\d+)?\s+(?:days?|months?))?).*?(?P<real_yield>-?\d+(?:\.\d+)?)%",
+            flags=re.IGNORECASE,
+        )
+        for match in row_pattern.finditer(joined_text):
+            maturity_text = match.group("maturity")
+            maturity_years = parse_time_to_maturity(maturity_text)
+            real_yield = pd.to_numeric(match.group("real_yield"), errors="coerce")
+            if pd.isna(maturity_years) or pd.isna(real_yield):
+                continue
+            regex_rows.append(
+                {
+                    "maturity_years": maturity_years,
+                    "yield_percent": float(real_yield),
+                    "curve_type": "Real",
+                    "curve_date": pd.Timestamp.today().normalize(),
+                    "source": "DividendData",
+                    "epic": match.group("epic"),
+                    "time_to_maturity": maturity_text,
+                    "real_yield_raw": f"{match.group('real_yield')}%",
+                }
+            )
+
+        if not regex_rows:
+            raise ValueError("DividendData fallback text parser could not find index-linked gilt rows.")
+        rows = regex_rows
     out = pd.DataFrame(rows).dropna(subset=["maturity_years", "yield_percent"])
     out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
     preview = out[["epic", "time_to_maturity", "real_yield_raw", "maturity_years", "yield_percent", "source"]].copy()
