@@ -2021,6 +2021,33 @@ if page_name == "Dashboard":
                                 """,
                                 unsafe_allow_html=True,
                             )
+                
+                elif len(items) == 5:
+                    row1 = st.columns(3)
+                    row2 = st.columns(2)
+
+                    for idx, item in enumerate(items):
+                        val = lookup.get(item, {}).get(period, np.nan)
+                        colour = heat_colour(val, vmin, vmax)
+                        label = labels.get(item, item)
+
+                        if idx < 3:
+                            target_cols = row1
+                            target_idx = idx
+                        else:
+                            target_cols = row2
+                            target_idx = idx - 3
+
+                        with target_cols[target_idx]:
+                            st.markdown(
+                                f"""
+                                <div class="small-tile" style="background:{colour}; min-height:74px;">
+                                    <span class="tile-label tile-label-plain">{label}</span>
+                                    {format_pct(val)}
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
 
                 st.markdown("</div>", unsafe_allow_html=True)
                 st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
