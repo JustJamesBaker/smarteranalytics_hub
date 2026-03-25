@@ -285,6 +285,8 @@ ONS_CPI_INDEX_CSV_URL = (
 )
 BOE_YIELD_CURVE_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/latest-yield-curve-data.zip"
 DIVIDENDDATA_INDEX_LINKED_GILTS_URL = "https://www.dividenddata.co.uk/index-linked-gilts-prices-yields.py"
+DIVIDENDDATA_GILT_DETAIL_URL = "https://www.dividenddata.co.uk/gilts.py?ticker={ticker}"
+DIVIDENDDATA_SHORT_END_TICKERS = ["TR26", "T27", "T28", "T29", "TR31"]
 
 DEFAULT_ASSET_ORDER = [
     "Global stocks",
@@ -873,6 +875,10 @@ def fetch_dividenddata_html(page_url: str) -> str:
     return response.text
 
 
+def fetch_dividenddata_gilt_detail_html(ticker: str) -> str:
+    return fetch_dividenddata_html(DIVIDENDDATA_GILT_DETAIL_URL.format(ticker=ticker))
+
+
 class SimpleHTMLTableParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -1077,6 +1083,58 @@ def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFr
     return out[["maturity_years", "yield_percent", "curve_type", "curve_date", "source"]], preview
 
 
+def fetch_dividenddata_short_end_detail_fallback(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    today = pd.Timestamp.today().normalize()
+
+    for ticker in tickers:
+        try:
+            html = fetch_dividenddata_gilt_detail_html(ticker)
+        except Exception:
+            continue
+
+        text_parser = TextExtractingHTMLParser()
+        text_parser.feed(html)
+        text = " ".join(text_parser.parts)
+
+        maturity_match = re.search(r"Maturity Date[^0-9A-Za-z]+([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})", text, flags=re.IGNORECASE)
+        real_yield_match = re.search(r"Real Yield[^0-9\-]+(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
+        if real_yield_match is None:
+            real_yield_match = re.search(r"Current Yield[^0-9\-]+(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
+
+        if maturity_match is None or real_yield_match is None:
+            continue
+
+        maturity_date = pd.to_datetime(maturity_match.group(1), format="%d-%b-%Y", errors="coerce")
+        real_yield = pd.to_numeric(real_yield_match.group(1), errors="coerce")
+        if pd.isna(maturity_date) or pd.isna(real_yield):
+            continue
+
+        maturity_years = max((pd.Timestamp(maturity_date) - today).days / 365.25, 0)
+        if maturity_years <= 0:
+            continue
+
+        rows.append(
+            {
+                "maturity_years": maturity_years,
+                "yield_percent": float(real_yield),
+                "curve_type": "Real",
+                "curve_date": today,
+                "source": "DividendData detail",
+                "epic": ticker,
+                "time_to_maturity": f"{maturity_years:.3f} years",
+                "real_yield_raw": f"{float(real_yield):.3f}%",
+            }
+        )
+
+    if not rows:
+        raise ValueError("DividendData detail-page fallback could not parse any short-end index-linked gilts.")
+
+    out = pd.DataFrame(rows).sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
+    preview = out[["epic", "time_to_maturity", "real_yield_raw", "maturity_years", "yield_percent", "source"]].copy()
+    return out[["maturity_years", "yield_percent", "curve_type", "curve_date", "source"]], preview
+
+
 def parse_boe_spot_curve_workbook(workbook_bytes: bytes, curve_type: str) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
     raw = pd.read_excel(BytesIO(workbook_bytes), sheet_name="4. spot curve", header=None)
     if raw.shape[0] < 6 or raw.shape[1] < 2:
@@ -1193,7 +1251,10 @@ def fetch_dividenddata_real_yield_extension(page_url: str) -> tuple[pd.DataFrame
         preview["source"] = "DividendData"
         return out, preview
     except Exception:
-        return parse_dividenddata_text_fallback(html)
+        try:
+            return parse_dividenddata_text_fallback(html)
+        except Exception:
+            return fetch_dividenddata_short_end_detail_fallback(DIVIDENDDATA_SHORT_END_TICKERS)
 
 
 def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
