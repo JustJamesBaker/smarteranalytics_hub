@@ -1,6 +1,9 @@
 from pathlib import Path
 import base64
-from io import StringIO
+from io import BytesIO, StringIO
+from html.parser import HTMLParser
+import re
+import zipfile
 
 import altair as alt
 import numpy as np
@@ -33,8 +36,21 @@ APP_TITLE = "smarteranalytics™ Hub"
 PAGE_LABELS = {
     "Dashboard": "Market snapshot",
     "Charts": "Performance analysis",
+    "Risk": "Risk analysis",
+    "Yield": "Yield curves",
 }
 DISPLAY_NAME_OVERRIDES = {
+    "Global stocks": "Global market",
+    "UK stocks": "UK market",
+    "Developed stocks": "Developed market",
+    "Emerging stocks": "Emerging market",
+    "UK value stocks": "UK value",
+    "UK small stocks": "UK small",
+    "Developed value stocks": "Developed value",
+    "Developed small stocks": "Developed small",
+    "Emerging value stocks": "Emerging value",
+    "Emerging small stocks": "Emerging small",
+    "Developed REITs": "REITs",
     "Global GBP hedged bonds (0-5)": "Global bonds (0-5, GBP)",
 }
 
@@ -47,6 +63,14 @@ DASHBOARD_HORIZONS = {
 
 CHART_PERIODS = {
     "YTD": "YTD",
+    "1Y": "1 Year",
+    "3Y": "3 Year",
+    "5Y": "5 Year",
+    "10Y": "10 Year",
+    "20Y": "20 Year",
+}
+
+RISK_PERIODS = {
     "1Y": "1 Year",
     "3Y": "3 Year",
     "5Y": "5 Year",
@@ -165,16 +189,19 @@ DISPLAY_GROUPS_RELATIVE_MINOR = [
 ASSET_CLASS_ALIASES = {
     "Global equity": "Global stocks",
     "Global stocks": "Global stocks",
+    "Global market": "Global stocks",
     "World equity": "Global stocks",
     "World stocks": "Global stocks",
     "UK equity": "UK stocks",
     "UK stocks": "UK stocks",
+    "UK market": "UK stocks",
     "UK value": "UK value stocks",
     "UK value stocks": "UK value stocks",
     "UK small": "UK small stocks",
     "UK small stocks": "UK small stocks",
     "Developed equity": "Developed stocks",
     "Developed stocks": "Developed stocks",
+    "Developed market": "Developed stocks",
     "Developed value": "Developed value stocks",
     "Developed value stocks": "Developed value stocks",
     "Developed small": "Developed small stocks",
@@ -182,6 +209,7 @@ ASSET_CLASS_ALIASES = {
     "Emerging market equity": "Emerging stocks",
     "Emerging equity": "Emerging stocks",
     "Emerging stocks": "Emerging stocks",
+    "Emerging market": "Emerging stocks",
     "Emerging value": "Emerging value stocks",
     "Emerging value stocks": "Emerging value stocks",
     "Emerging small": "Emerging small stocks",
@@ -190,10 +218,13 @@ ASSET_CLASS_ALIASES = {
     "REITs": "Developed REITs",
     "Cash GBP": "Cash (GBP)",
     "Cash (GBP)": "Cash (GBP)",
+    "UK Gilts": "UK Gilts (0-5)",
     "Short Gilt": "UK Gilts (0-5)",
     "UK Gilts (0-5)": "UK Gilts (0-5)",
+    "UK IL Gilts": "UK IL Gilts (0-5)",
     "Short IL Gilt": "UK IL Gilts (0-5)",
     "UK IL Gilts (0-5)": "UK IL Gilts (0-5)",
+    "Global bonds (0-5, GBP)": "Global GBP hedged bonds (0-5)",
     "Global GBP Hedged bonds (0-5)": "Global GBP hedged bonds (0-5)",
     "Global GBP hedged bonds (0-5)": "Global GBP hedged bonds (0-5)",
     "Global Short Bond GBP": "Global GBP hedged bonds (0-5)",
@@ -252,6 +283,8 @@ ONS_CPI_INDEX_CSV_URL = (
     "https://www.ons.gov.uk/generator?format=csv&uri="
     "/economy/inflationandpriceindices/timeseries/d7bt/mm23"
 )
+BOE_YIELD_CURVE_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/latest-yield-curve-data.zip"
+DIVIDENDDATA_INDEX_LINKED_GILTS_URL = "https://www.dividenddata.co.uk/index-linked-gilts-prices-yields.py"
 
 DEFAULT_ASSET_ORDER = [
     "Global stocks",
@@ -295,7 +328,7 @@ ASSET_COLOURS = {
     "Emerging value stocks": "#ffd965",
     "Emerging small stocks": "#cfa400",
     "Developed REITs": "#2e8b57",
-    "Cash (GBP)": "#90caf9",
+    "Cash (GBP)": "#4b5563",
     "UK Gilts (0-5)": "#1f77b4",
     "UK IL Gilts (0-5)": "#5dade2",
     "Global GBP hedged bonds (0-5)": "#0b5394",
@@ -372,6 +405,43 @@ def heat_colour(value: float, vmin: float, vmax: float) -> str:
     light = np.array([130, 130, 130])
     dark = np.array([190, 30, 55])
     rgb = (light * (1 - norm) + dark * norm).astype(int)
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def rank_heat_colour(value: float, vmin: float, vmax: float, low_is_good: bool = False) -> str:
+    if pd.isna(value):
+        return "#E9E9E9"
+    if vmax <= vmin:
+        return "#f6f6f6"
+
+    norm = (float(value) - float(vmin)) / (float(vmax) - float(vmin))
+    norm = min(max(norm, 0), 1)
+    if low_is_good:
+        norm = 1 - norm
+
+    start = np.array([190, 30, 55])
+    end = np.array([0, 170, 95])
+    rgb = (start * (1 - norm) + end * norm).astype(int)
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def correlation_heat_colour(value: float) -> str:
+    if pd.isna(value):
+        return "#E9E9E9"
+    value = float(value)
+    grey = np.array([138, 138, 138])
+    green = np.array([0, 170, 95])
+    red = np.array([190, 30, 55])
+
+    if np.isclose(value, 1.0):
+        rgb = grey
+    elif value >= 0.5:
+        norm = min(max((value - 0.5) / 0.49, 0), 1)
+        rgb = (grey * (1 - norm) + red * norm).astype(int)
+    else:
+        norm = min(max(value / 0.5, 0), 1)
+        rgb = (green * (1 - norm) + grey * norm).astype(int)
+
     return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
 
 
@@ -775,6 +845,289 @@ def build_ons_fetch_diagnostics(csv_url: str) -> tuple[pd.DataFrame, pd.DataFram
         return summary, pd.DataFrame()
 
 
+@st.cache_data(show_spinner=False, ttl=43200)
+def fetch_boe_yield_curve_zip(zip_url: str) -> bytes:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(zip_url, headers=headers, timeout=45)
+    response.raise_for_status()
+    return response.content
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def fetch_dividenddata_html(page_url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(page_url, headers=headers, timeout=45)
+    response.raise_for_status()
+    return response.text
+
+
+class SimpleHTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._in_table = False
+        self._in_row = False
+        self._in_cell = False
+        self._current_table: list[list[str]] = []
+        self._current_row: list[str] = []
+        self._current_cell: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "table":
+            self._in_table = True
+            self._current_table = []
+        elif tag == "tr" and self._in_table:
+            self._in_row = True
+            self._current_row = []
+        elif tag in {"td", "th"} and self._in_row:
+            self._in_cell = True
+            self._current_cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._current_cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._in_cell:
+            cell_text = " ".join(part.strip() for part in self._current_cell if part.strip()).strip()
+            self._current_row.append(cell_text)
+            self._in_cell = False
+            self._current_cell = []
+        elif tag == "tr" and self._in_row:
+            if self._current_row:
+                self._current_table.append(self._current_row)
+            self._in_row = False
+            self._current_row = []
+        elif tag == "table" and self._in_table:
+            if self._current_table:
+                self.tables.append(self._current_table)
+            self._in_table = False
+            self._current_table = []
+
+
+def pick_boe_zip_member(member_names: list[str], target_text: str) -> str:
+    target = target_text.strip().lower()
+    candidates = [name for name in member_names if target in name.lower()]
+    if not candidates:
+        raise FileNotFoundError(f"Could not find '{target_text}' in BOE yield-curve zip.")
+    return sorted(candidates)[0]
+
+
+def parse_maturity_label(value: object) -> float:
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric):
+        return float(numeric)
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+    return float(match.group(1)) if match else np.nan
+
+
+def parse_time_to_maturity(value: object) -> float:
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip().lower()
+    if not text:
+        return np.nan
+
+    years = 0.0
+    months = 0.0
+    days = 0.0
+
+    year_match = re.search(r"(\d+(?:\.\d+)?)\s*year", text)
+    month_match = re.search(r"(\d+(?:\.\d+)?)\s*month", text)
+    day_match = re.search(r"(\d+(?:\.\d+)?)\s*day", text)
+
+    if year_match:
+        years = float(year_match.group(1))
+    if month_match:
+        months = float(month_match.group(1))
+    if day_match:
+        days = float(day_match.group(1))
+
+    if years == 0 and months == 0 and days == 0:
+        numeric = pd.to_numeric(text, errors="coerce")
+        return float(numeric) if pd.notna(numeric) else np.nan
+
+    return years + (months / 12.0) + (days / 365.25)
+
+
+def parse_boe_spot_curve_workbook(workbook_bytes: bytes, curve_type: str) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
+    raw = pd.read_excel(BytesIO(workbook_bytes), sheet_name="4. spot curve", header=None)
+    if raw.shape[0] < 6 or raw.shape[1] < 2:
+        raise ValueError(f"BOE {curve_type} spot curve sheet is missing expected rows/columns.")
+
+    candidate_rows = []
+    for row_idx in range(min(10, len(raw))):
+        parsed_row = raw.iloc[row_idx, 1:].map(parse_maturity_label)
+        candidate_rows.append((row_idx, int(parsed_row.notna().sum()), parsed_row))
+
+    maturity_row_idx, maturity_count, maturities = max(candidate_rows, key=lambda x: x[1])
+    if maturity_count == 0:
+        raise ValueError(f"BOE {curve_type} spot curve maturities could not be parsed.")
+
+    data_rows = raw.iloc[maturity_row_idx + 1 :, :].copy()
+    data_rows = data_rows.rename(columns={0: "date_raw"})
+    data_rows["curve_date"] = pd.to_datetime(data_rows["date_raw"], errors="coerce")
+    value_block = data_rows.iloc[:, 1 : 1 + len(maturities)].apply(pd.to_numeric, errors="coerce")
+
+    valid_mask = data_rows["curve_date"].notna() & value_block.notna().any(axis=1)
+    valid_rows = data_rows.loc[valid_mask].copy()
+    valid_values = value_block.loc[valid_mask].copy()
+    if valid_rows.empty:
+        raise ValueError(f"BOE {curve_type} spot curve sheet had no valid dated rows.")
+
+    latest_idx = valid_rows.index[-1]
+    curve_date = pd.Timestamp(valid_rows.loc[latest_idx, "curve_date"])
+    latest_values = valid_values.loc[latest_idx]
+
+    points = pd.DataFrame(
+        {
+            "maturity_years": pd.to_numeric(maturities, errors="coerce"),
+            "yield_percent": pd.to_numeric(latest_values, errors="coerce"),
+            "curve_type": curve_type,
+            "curve_date": curve_date,
+        }
+    ).dropna(subset=["maturity_years", "yield_percent"])
+
+    preview = valid_rows[["curve_date"]].copy()
+    preview["points_available"] = valid_values.notna().sum(axis=1).values
+    preview["curve_type"] = curve_type
+    preview["maturity_row_idx"] = maturity_row_idx + 1
+    preview["curve_date"] = pd.to_datetime(preview["curve_date"], errors="coerce")
+    return points.sort_values("maturity_years"), curve_date, preview
+
+
+def fetch_dividenddata_real_yield_extension(page_url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    html = fetch_dividenddata_html(page_url)
+    parser = SimpleHTMLTableParser()
+    parser.feed(html)
+
+    target_rows = None
+    maturity_idx = None
+    real_yield_idx = None
+    for table_rows in parser.tables:
+        if not table_rows:
+            continue
+        header = [str(x).strip() for x in table_rows[0]]
+        header_lookup = {col.lower(): idx for idx, col in enumerate(header)}
+        maturity_idx = next((idx for col, idx in header_lookup.items() if "time to maturity" in col), None)
+        real_yield_idx = next((idx for col, idx in header_lookup.items() if "real yield" in col), None)
+        if maturity_idx is not None and real_yield_idx is not None:
+            target_rows = table_rows
+            break
+
+    if not target_rows or maturity_idx is None or real_yield_idx is None:
+        raise ValueError("DividendData table with 'Time to Maturity' and 'Real Yield' columns was not found.")
+
+    header = target_rows[0]
+    body = target_rows[1:]
+    table = pd.DataFrame(body, columns=header)
+    maturity_col = header[maturity_idx]
+    real_yield_col = header[real_yield_idx]
+    out = pd.DataFrame(
+        {
+            "maturity_years": table[maturity_col].map(parse_time_to_maturity),
+            "yield_percent": pd.to_numeric(
+                table[real_yield_col].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
+                errors="coerce",
+            ),
+            "curve_type": "Real",
+            "curve_date": pd.Timestamp.today().normalize(),
+            "source": "DividendData",
+        }
+    ).dropna(subset=["maturity_years", "yield_percent"])
+    out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
+
+    preview = table[[maturity_col, real_yield_col]].copy()
+    preview.columns = ["time_to_maturity", "real_yield_raw"]
+    preview["maturity_years"] = preview["time_to_maturity"].map(parse_time_to_maturity)
+    preview["yield_percent"] = pd.to_numeric(
+        preview["real_yield_raw"].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    preview["source"] = "DividendData"
+    return out, preview
+
+
+def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    try:
+        zip_bytes = fetch_boe_yield_curve_zip(zip_url)
+        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+            members = zf.namelist()
+            nominal_member = pick_boe_zip_member(members, "GLC Nominal daily data current month")
+            real_member = pick_boe_zip_member(members, "GLC Real daily data current month")
+            nominal_points, nominal_date, nominal_preview = parse_boe_spot_curve_workbook(
+                zf.read(nominal_member),
+                "Nominal",
+            )
+            real_points, real_date, real_preview = parse_boe_spot_curve_workbook(
+                zf.read(real_member),
+                "Real",
+            )
+
+        nominal_points["source"] = "BOE"
+        real_points["source"] = "BOE"
+
+        extension_points, extension_preview = fetch_dividenddata_real_yield_extension(dividenddata_url)
+        short_real_extension = pd.DataFrame(columns=real_points.columns)
+        if not real_points.empty and not extension_points.empty:
+            real_min_maturity = float(real_points["maturity_years"].min())
+            short_real_extension = extension_points[extension_points["maturity_years"] < real_min_maturity].copy()
+            if not short_real_extension.empty:
+                short_real_extension["curve_date"] = real_date
+
+        real_combined = pd.concat([short_real_extension, real_points], ignore_index=True)
+        real_combined = real_combined.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="last")
+        combined = pd.concat([nominal_points, real_combined], ignore_index=True)
+        summary = pd.DataFrame(
+            [
+                {"metric": "Fetch status", "value": "OK"},
+                {"metric": "Source URL", "value": zip_url},
+                {"metric": "Extension URL", "value": dividenddata_url},
+                {"metric": "Archive members", "value": int(len(members))},
+                {"metric": "Nominal workbook", "value": nominal_member},
+                {"metric": "Nominal latest date", "value": format_diag_date(nominal_date)},
+                {"metric": "Nominal points", "value": int(len(nominal_points))},
+                {"metric": "Real workbook", "value": real_member},
+                {"metric": "Real latest date", "value": format_diag_date(real_date)},
+                {"metric": "Real points", "value": int(len(real_points))},
+                {"metric": "Real extension points", "value": int(len(short_real_extension))},
+                {
+                    "metric": "Real extension max maturity",
+                    "value": "-" if short_real_extension.empty else round(float(short_real_extension["maturity_years"].max()), 3),
+                },
+            ]
+        )
+        preview = pd.concat([nominal_preview.tail(10), real_preview.tail(10), extension_preview.head(10)], ignore_index=True)
+        preview["curve_date"] = pd.to_datetime(preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+        return combined, summary, preview
+    except Exception as exc:
+        summary = pd.DataFrame(
+            [
+                {"metric": "Fetch status", "value": "Failed"},
+                {"metric": "Source URL", "value": zip_url},
+                {"metric": "Extension URL", "value": dividenddata_url},
+                {"metric": "Error type", "value": type(exc).__name__},
+                {"metric": "Error", "value": str(exc)},
+            ]
+        )
+        return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"]), summary, pd.DataFrame()
+
+
 def build_asset_coverage_table(
     mapping: pd.DataFrame,
     monthly_levels: dict[str, pd.Series],
@@ -1016,14 +1369,27 @@ def load_data(file_path: str, file_mtime: float) -> tuple[pd.DataFrame, pd.DataF
     ts = ts.rename(columns={ts.columns[0]: "Date"})
     ts = ts.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
+    normalized_mapping_cols = {str(c).strip().lower(): str(c).strip() for c in mapping.columns}
     rename_map = {}
-    if len(mapping.columns) >= 1:
+    explicit_name_map = {
+        "index_name": "index_name",
+        "asset_class": "asset_class",
+        "live_fund_primary": "live_fund_primary",
+        "live_fund_secondary": "live_fund_secondary",
+        "growth/defensive": "growth_defensive",
+        "growth_defensive": "growth_defensive",
+    }
+    for source_name, target_name in explicit_name_map.items():
+        if source_name in normalized_mapping_cols:
+            rename_map[normalized_mapping_cols[source_name]] = target_name
+
+    if "index_name" not in rename_map.values() and len(mapping.columns) >= 1:
         rename_map[mapping.columns[0]] = "index_name"
-    if len(mapping.columns) >= 2:
+    if "asset_class" not in rename_map.values() and len(mapping.columns) >= 2:
         rename_map[mapping.columns[1]] = "asset_class"
-    if len(mapping.columns) >= 3:
+    if "live_fund_primary" not in rename_map.values() and len(mapping.columns) >= 3:
         rename_map[mapping.columns[2]] = "live_fund_primary"
-    if len(mapping.columns) >= 4:
+    if "live_fund_secondary" not in rename_map.values() and len(mapping.columns) >= 4:
         rename_map[mapping.columns[3]] = "live_fund_secondary"
     mapping = mapping.rename(columns=rename_map)
 
@@ -1038,6 +1404,9 @@ def load_data(file_path: str, file_mtime: float) -> tuple[pd.DataFrame, pd.DataF
 
     if "live_fund_secondary" in mapping.columns:
         mapping["live_fund_secondary"] = mapping["live_fund_secondary"].map(normalise_ticker)
+
+    if "growth_defensive" in mapping.columns:
+        mapping["growth_defensive"] = pd.to_numeric(mapping["growth_defensive"], errors="coerce")
 
     valid_rows = mapping[mapping["index_name"].isin(ts.columns)].copy()
     return ts, valid_rows
@@ -1132,7 +1501,7 @@ def pick_live_ticker_for_asset(row: pd.Series, prices_df: pd.DataFrame) -> tuple
 def build_stitched_asset_series(monthly_levels: dict[str, pd.Series], mapping: pd.DataFrame, prices_df: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFrame]:
     stitched = {}
     diag_rows = []
-    deduped_mapping = mapping.drop_duplicates(subset=["asset_class"]).copy()
+    deduped_mapping = mapping.drop_duplicates(subset=["asset_class"], keep="last").copy()
 
     for asset_class in sorted(deduped_mapping["asset_class"].dropna().astype(str).unique()):
         row_match = deduped_mapping[deduped_mapping["asset_class"] == asset_class]
@@ -1255,7 +1624,7 @@ def build_stitched_asset_series(monthly_levels: dict[str, pd.Series], mapping: p
 def build_chart_preferred_series(monthly_levels: dict[str, pd.Series], mapping: pd.DataFrame, prices_df: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFrame]:
     chart_series_map = {}
     diag_rows = []
-    deduped_mapping = mapping.drop_duplicates(subset=["asset_class"]).copy()
+    deduped_mapping = mapping.drop_duplicates(subset=["asset_class"], keep="last").copy()
 
     for asset_class in sorted(deduped_mapping["asset_class"].dropna().astype(str).unique()):
         row_match = deduped_mapping[deduped_mapping["asset_class"] == asset_class]
@@ -1478,6 +1847,302 @@ def build_growth_of_wealth_df(
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["Date", "Growth", "asset_class"])
 
 
+def build_monthly_level_window(series: pd.Series, end_date: pd.Timestamp, years: int) -> pd.Series:
+    s = series.dropna().sort_index()
+    s = s[s.index <= end_date]
+    if s.empty:
+        return pd.Series(dtype=float)
+
+    monthly = s.resample("ME").last().dropna()
+    if monthly.empty:
+        return pd.Series(dtype=float)
+
+    base_date, _ = nearest_level_on_or_before(monthly, end_date - pd.DateOffset(years=years))
+    if base_date is None:
+        return pd.Series(dtype=float)
+
+    return monthly[monthly.index >= base_date].copy()
+
+
+def build_monthly_level_window_from_start(series: pd.Series, end_date: pd.Timestamp, start_date: pd.Timestamp) -> pd.Series:
+    s = series.dropna().sort_index()
+    s = s[s.index <= end_date]
+    if s.empty:
+        return pd.Series(dtype=float)
+
+    monthly = s.resample("ME").last().dropna()
+    if monthly.empty:
+        return pd.Series(dtype=float)
+
+    base_date, _ = nearest_level_on_or_before(monthly, start_date)
+    if base_date is None:
+        return pd.Series(dtype=float)
+
+    return monthly[monthly.index >= base_date].copy()
+
+
+def calc_annualised_volatility(series: pd.Series, end_date: pd.Timestamp, years: int) -> float:
+    window = build_monthly_level_window(series, end_date, years)
+    monthly_returns = window.pct_change().dropna()
+    if monthly_returns.empty or len(monthly_returns) < 2:
+        return np.nan
+    return float(monthly_returns.std(ddof=1) * np.sqrt(12))
+
+
+def build_monthly_return_window(series: pd.Series, end_date: pd.Timestamp, years: int) -> pd.Series:
+    window = build_monthly_level_window(series, end_date, years)
+    if window.empty:
+        return pd.Series(dtype=float)
+    return window.pct_change().dropna()
+
+
+def build_monthly_return_window_from_start(series: pd.Series, end_date: pd.Timestamp, start_date: pd.Timestamp) -> pd.Series:
+    window = build_monthly_level_window_from_start(series, end_date, start_date)
+    if window.empty:
+        return pd.Series(dtype=float)
+    return window.pct_change().dropna()
+
+
+def calc_tracking_error(series: pd.Series, benchmark_series: pd.Series, end_date: pd.Timestamp, years: int) -> float:
+    asset_returns = build_monthly_return_window(series, end_date, years)
+    benchmark_returns = build_monthly_return_window(benchmark_series, end_date, years)
+    aligned = pd.concat([asset_returns.rename("asset"), benchmark_returns.rename("benchmark")], axis=1).dropna()
+    if aligned.empty or len(aligned) < 2:
+        return np.nan
+    return float((aligned["asset"] - aligned["benchmark"]).std(ddof=1) * np.sqrt(12))
+
+
+def calc_tracking_error_from_start(series: pd.Series, benchmark_series: pd.Series, end_date: pd.Timestamp, start_date: pd.Timestamp) -> float:
+    asset_returns = build_monthly_return_window_from_start(series, end_date, start_date)
+    benchmark_returns = build_monthly_return_window_from_start(benchmark_series, end_date, start_date)
+    aligned = pd.concat([asset_returns.rename("asset"), benchmark_returns.rename("benchmark")], axis=1).dropna()
+    if aligned.empty or len(aligned) < 2:
+        return np.nan
+    excess_returns = aligned["asset"] - aligned["benchmark"]
+    return float(excess_returns.std(ddof=1) * np.sqrt(12))
+
+
+def calc_downside_deviation(series: pd.Series, end_date: pd.Timestamp, years: int) -> float:
+    monthly_returns = build_monthly_return_window(series, end_date, years)
+    if monthly_returns.empty:
+        return np.nan
+    downside = monthly_returns.clip(upper=0)
+    return float(np.sqrt((downside.pow(2)).mean()) * np.sqrt(12))
+
+
+def calc_downside_deviation_from_start(series: pd.Series, end_date: pd.Timestamp, start_date: pd.Timestamp) -> float:
+    monthly_returns = build_monthly_return_window_from_start(series, end_date, start_date)
+    if monthly_returns.empty:
+        return np.nan
+    downside = monthly_returns.clip(upper=0)
+    return float(np.sqrt((downside.pow(2)).mean()) * np.sqrt(12))
+
+
+def calc_annualised_volatility_from_start(series: pd.Series, end_date: pd.Timestamp, start_date: pd.Timestamp) -> float:
+    monthly_returns = build_monthly_return_window_from_start(series, end_date, start_date)
+    if monthly_returns.empty or len(monthly_returns) < 2:
+        return np.nan
+    return float(monthly_returns.std(ddof=1) * np.sqrt(12))
+
+
+def calc_worst_drawdown_since_inception(series: pd.Series) -> float:
+    s = series.dropna().sort_index()
+    if s.empty:
+        return np.nan
+    drawdown = (s / s.cummax()) - 1
+    return float(drawdown.min())
+
+
+def build_risk_summary_table(
+    series_map: dict[str, pd.Series],
+    asset_style_map: dict[str, float],
+    selected_assets: list[str],
+    end_date: pd.Timestamp,
+    start_date: pd.Timestamp,
+) -> pd.DataFrame:
+    rows = []
+    cash_series = series_map.get("Cash (GBP)", pd.Series(dtype=float))
+    global_series = series_map.get("Global stocks", pd.Series(dtype=float))
+    developed_series = series_map.get("Developed stocks", pd.Series(dtype=float))
+    assets = selected_assets if selected_assets else list(series_map.keys())
+
+    for asset in assets:
+        if asset not in series_map:
+            continue
+
+        series = series_map[asset]
+        period_return = calc_period_return(series, end_date, "Period", whole_period_start=start_date)
+        period_vol = calc_annualised_volatility_from_start(series, end_date, start_date)
+        downside_dev = calc_downside_deviation_from_start(series, end_date, start_date)
+        worst_drawdown = calc_worst_drawdown_since_inception(series)
+
+        growth_flag = asset_style_map.get(asset, np.nan)
+        benchmark_asset = "Global stocks" if growth_flag == 1 else "Cash (GBP)"
+        benchmark_series = global_series if benchmark_asset == "Global stocks" else cash_series
+        benchmark_return = (
+            calc_period_return(benchmark_series, end_date, "Period", whole_period_start=start_date)
+            if not benchmark_series.empty
+            else np.nan
+        )
+        tracking_error = (
+            calc_tracking_error_from_start(series, benchmark_series, end_date, start_date)
+            if not benchmark_series.empty and asset != benchmark_asset
+            else np.nan
+        )
+
+        return_vol_ratio = (
+            period_return / period_vol
+            if pd.notna(period_return) and pd.notna(period_vol) and period_vol > 0
+            else np.nan
+        )
+        sharpe_ratio = (
+            (period_return - calc_period_return(cash_series, end_date, period_key)) / period_vol
+            if not cash_series.empty and pd.notna(period_vol) and period_vol > 0
+            else np.nan
+        )
+        information_ratio = (
+            (period_return - benchmark_return) / tracking_error
+            if pd.notna(benchmark_return) and pd.notna(tracking_error) and tracking_error > 0
+            else np.nan
+        )
+        sortino_ratio = (
+            period_return / downside_dev
+            if pd.notna(period_return) and pd.notna(downside_dev) and downside_dev > 0
+            else np.nan
+        )
+        calmar_ratio = (
+            period_return / abs(worst_drawdown)
+            if pd.notna(period_return) and pd.notna(worst_drawdown) and worst_drawdown < 0
+            else np.nan
+        )
+
+        if asset == "Cash (GBP)":
+            return_vol_ratio = np.nan
+            sharpe_ratio = np.nan
+            information_ratio = np.nan
+            sortino_ratio = np.nan
+            worst_drawdown = np.nan
+            calmar_ratio = np.nan
+            tracking_error = np.nan
+
+        rows.append(
+            {
+                "asset_class": asset,
+                "Period return": period_return,
+                "Period vol": period_vol,
+                "Return/vol ratio": return_vol_ratio,
+                "Sharpe ratio": sharpe_ratio,
+                "Information ratio": information_ratio,
+                "Sortino ratio": sortino_ratio,
+                "Worst drawdown": worst_drawdown,
+                "Calmar ratio": calmar_ratio,
+                "Tracking error": tracking_error,
+            }
+        )
+
+    out = order_asset_rows(pd.DataFrame(rows))
+    if not out.empty and "asset_class" in out.columns:
+        cash_rows = out[out["asset_class"] == "Cash (GBP)"]
+        non_cash_rows = out[out["asset_class"] != "Cash (GBP)"]
+        out = pd.concat([non_cash_rows, cash_rows], ignore_index=True)
+    return out
+
+
+def build_correlation_matrix_table(
+    series_map: dict[str, pd.Series],
+    selected_assets: list[str],
+    end_date: pd.Timestamp,
+    start_date: pd.Timestamp,
+) -> pd.DataFrame:
+    assets = selected_assets if selected_assets else list(series_map.keys())
+    return_frames = []
+
+    for asset in assets:
+        if asset not in series_map:
+            continue
+        monthly_returns = build_monthly_return_window_from_start(series_map[asset], end_date, start_date)
+        if monthly_returns.empty:
+            continue
+        return_frames.append(monthly_returns.rename(asset))
+
+    if not return_frames:
+        return pd.DataFrame()
+
+    returns_df = pd.concat(return_frames, axis=1).dropna(how="all")
+    if returns_df.empty:
+        return pd.DataFrame()
+
+    corr = returns_df.corr()
+    ordered_assets = [c for c in assets if c in corr.index and c != "Cash (GBP)"]
+    if "Cash (GBP)" in corr.index:
+        ordered_assets.append("Cash (GBP)")
+    corr = corr.reindex(index=ordered_assets, columns=ordered_assets)
+
+    for row_idx, row_name in enumerate(corr.index):
+        for col_idx, col_name in enumerate(corr.columns):
+            if col_idx > row_idx:
+                corr.loc[row_name, col_name] = np.nan
+
+    corr = corr.reset_index().rename(columns={"index": "asset_class"})
+    return corr
+
+
+def build_risk_metrics_table(
+    series_map: dict[str, pd.Series],
+    selected_assets: list[str],
+    end_date: pd.Timestamp,
+    period_keys: list[str],
+) -> pd.DataFrame:
+    rows = []
+    assets = selected_assets if selected_assets else list(series_map.keys())
+
+    for asset in assets:
+        if asset not in series_map:
+            continue
+
+        row = {"asset_class": asset}
+        series = series_map[asset]
+        for period_key in period_keys:
+            years = int(period_key.replace("Y", ""))
+            row[f"{period_key} Return"] = calc_period_return(series, end_date, period_key)
+            row[f"{period_key} Vol"] = calc_annualised_volatility(series, end_date, years)
+        rows.append(row)
+
+    return order_asset_rows(pd.DataFrame(rows))
+
+
+def build_risk_scatter_df(
+    series_map: dict[str, pd.Series],
+    selected_assets: list[str],
+    end_date: pd.Timestamp,
+    period_key: str,
+) -> pd.DataFrame:
+    rows = []
+    years = int(period_key.replace("Y", ""))
+    assets = selected_assets if selected_assets else list(series_map.keys())
+
+    for asset in assets:
+        if asset not in series_map:
+            continue
+
+        series = series_map[asset]
+        annual_return = calc_period_return(series, end_date, period_key)
+        annual_vol = calc_annualised_volatility(series, end_date, years)
+        if pd.isna(annual_return) or pd.isna(annual_vol):
+            continue
+
+        rows.append(
+            {
+                "asset_class": asset,
+                "display_asset_class": display_name(asset),
+                "annual_return": annual_return,
+                "annual_volatility": annual_vol,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def build_calendar_year_returns(stitched_series_map: dict[str, pd.Series], end_date: pd.Timestamp, years_back: int = 10) -> pd.DataFrame:
     last_complete_year = end_date.year - 1
     years = list(reversed(list(range(last_complete_year - years_back + 1, last_complete_year + 1))))
@@ -1513,6 +2178,11 @@ def build_html_table(
     df: pd.DataFrame,
     percent_cols: list[str] | None = None,
     conditional_cols: list[str] | None = None,
+    header_wrap_cols: list[str] | None = None,
+    invert_conditional_cols: list[str] | None = None,
+    rank_conditional_cols: list[str] | None = None,
+    decimal_cols: list[str] | None = None,
+    correlation_conditional_cols: list[str] | None = None,
 ) -> str:
     if df.empty:
         return '<div class="table-shell"><div class="table-empty">No data available.</div></div>'
@@ -1525,6 +2195,11 @@ def build_html_table(
     cols = list(display_df.columns)
     percent_cols = set(percent_cols or [])
     conditional_cols = set(conditional_cols or [])
+    header_wrap_cols = set(header_wrap_cols or [])
+    invert_conditional_cols = set(invert_conditional_cols or [])
+    rank_conditional_cols = set(rank_conditional_cols or [])
+    decimal_cols = set(decimal_cols or [])
+    correlation_conditional_cols = set(correlation_conditional_cols or [])
     if cols:
         asset_col_width = 28 if "Asset class" in cols else 0
         other_count = len(cols) - (1 if "Asset class" in cols else 0)
@@ -1540,7 +2215,12 @@ def build_html_table(
         ]
     )
 
-    thead = "".join([f"<th>{col}</th>" for col in cols])
+    thead = "".join(
+        [
+            f"<th>{col.replace(' ', '<br>') if col in header_wrap_cols else col}</th>"
+            for col in cols
+        ]
+    )
 
     heat_bounds = {}
     for col in cols:
@@ -1558,19 +2238,35 @@ def build_html_table(
         for col in cols:
             value = row[col]
             source_col = "asset_class" if col == "Asset class" else col
-            cell_text = ""
+            cell_text = "-"
             cell_style = ""
 
             if pd.notna(value):
                 if source_col in percent_cols:
                     cell_text = format_pct(float(value))
+                elif source_col in decimal_cols:
+                    cell_text = f"{float(value):.2f}"
                 else:
                     cell_text = str(value)
 
             if source_col in heat_bounds and pd.notna(value):
                 vmin, vmax = heat_bounds[source_col]
+                if source_col in correlation_conditional_cols:
+                    bg_colour = correlation_heat_colour(float(value))
+                elif source_col in rank_conditional_cols:
+                    bg_colour = rank_heat_colour(
+                        float(value),
+                        vmin,
+                        vmax,
+                        low_is_good=source_col in invert_conditional_cols,
+                    )
+                else:
+                    heat_value = -float(value) if source_col in invert_conditional_cols else float(value)
+                    heat_vmin = -vmax if source_col in invert_conditional_cols else vmin
+                    heat_vmax = -vmin if source_col in invert_conditional_cols else vmax
+                    bg_colour = heat_colour(heat_value, heat_vmin, heat_vmax)
                 cell_style = (
-                    f' style="background:{heat_colour(float(value), vmin, vmax)};'
+                    f' style="background:{bg_colour};'
                     ' color:#ffffff; font-weight:600;"'
                 )
 
@@ -1693,7 +2389,7 @@ def build_chart(chart_df: pd.DataFrame, selected_assets: list[str], period_key: 
         .properties(
             height=420,
             width="container",
-            padding={"left": 8, "top": 8, "right": max(10, int(get_chart_right_padding_days(period_key) * 0.6)), "bottom": 8},
+            padding={"left": 14, "top": 8, "right": max(28, int(get_chart_right_padding_days(period_key) * 0.8)), "bottom": 10},
         )
         .configure_view(stroke=None, fill=CHART_BG_GREY)
         .configure_axis(labelFont="Calibri", titleFont="Calibri")
@@ -1705,6 +2401,193 @@ def build_chart(chart_df: pd.DataFrame, selected_assets: list[str], period_key: 
         )
         .configure(background=CHART_BG_GREY)
     )
+
+
+def build_risk_scatter_chart(risk_df: pd.DataFrame, selected_assets: list[str]) -> alt.Chart:
+    if risk_df.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_circle()
+
+    colour_domain = [
+        display_name(a)
+        for a in selected_assets
+        if display_name(a) in risk_df["display_asset_class"].unique()
+    ]
+    colour_range = [
+        ASSET_COLOURS.get(a, "#1f77b4")
+        for a in selected_assets
+        if display_name(a) in risk_df["display_asset_class"].unique()
+    ]
+
+    return (
+        alt.Chart(risk_df)
+        .mark_circle(size=180, opacity=0.95)
+        .encode(
+            x=alt.X(
+                "annual_volatility:Q",
+                title="Annualised volatility",
+                axis=alt.Axis(
+                    format=".0%",
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                ),
+            ),
+            y=alt.Y(
+                "annual_return:Q",
+                title="Annualised return",
+                axis=alt.Axis(
+                    format=".0%",
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                ),
+            ),
+            color=alt.Color(
+                "display_asset_class:N",
+                title=None,
+                scale=alt.Scale(domain=colour_domain, range=colour_range),
+                legend=alt.Legend(
+                    labelColor=TEXT_GREY,
+                    orient="bottom",
+                    direction="horizontal",
+                    columns=max(1, len(colour_domain)),
+                    symbolLimit=len(colour_domain),
+                    labelLimit=180,
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("display_asset_class:N", title="Asset class"),
+                alt.Tooltip("annual_return:Q", title="Annualised return", format=".2%"),
+                alt.Tooltip("annual_volatility:Q", title="Annualised volatility", format=".2%"),
+            ],
+        )
+        .properties(height=420, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .configure_view(stroke=None, fill=CHART_BG_GREY)
+        .configure_axis(labelFont="Calibri", titleFont="Calibri")
+        .configure_legend(
+            labelFont="Calibri",
+            titleFont="Calibri",
+            fillColor=CHART_BG_GREY,
+            strokeColor=CHART_BG_GREY,
+        )
+        .configure(background=CHART_BG_GREY)
+    )
+
+
+def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
+    if yield_curve_df.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
+
+    chart_df = yield_curve_df.copy()
+    chart_df["curve_type"] = pd.Categorical(chart_df["curve_type"], categories=["Nominal", "Real", "Breakeven inflation"], ordered=True)
+    chart_df["yield_decimal"] = pd.to_numeric(chart_df["yield_percent"], errors="coerce") / 100.0
+
+    return (
+        alt.Chart(chart_df)
+        .mark_line(point=True, strokeWidth=2.8)
+        .encode(
+            x=alt.X(
+                "maturity_years:Q",
+                title="Maturity (years)",
+                axis=alt.Axis(
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y(
+                "yield_decimal:Q",
+                title="Yield",
+                axis=alt.Axis(
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                    format=".0%",
+                ),
+            ),
+            color=alt.Color(
+                "curve_type:N",
+                title=None,
+                scale=alt.Scale(domain=["Nominal", "Real", "Breakeven inflation"], range=["#c95b2b", "#1f77b4", "#2e8b57"]),
+                legend=alt.Legend(
+                    labelColor=TEXT_GREY,
+                    orient="bottom",
+                    direction="horizontal",
+                    columns=3,
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("curve_type:N", title="Curve"),
+                alt.Tooltip("curve_date:T", title="Date"),
+                alt.Tooltip("maturity_years:Q", title="Maturity (years)", format=".1f"),
+                alt.Tooltip("yield_decimal:Q", title="Yield", format=".2%"),
+            ],
+        )
+        .properties(height=420, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .configure_view(stroke=None, fill=CHART_BG_GREY)
+        .configure_axis(labelFont="Calibri", titleFont="Calibri")
+        .configure_legend(
+            labelFont="Calibri",
+            titleFont="Calibri",
+            fillColor=CHART_BG_GREY,
+            strokeColor=CHART_BG_GREY,
+        )
+        .configure(background=CHART_BG_GREY)
+    )
+
+
+def build_yield_curve_display_df(yield_curve_df: pd.DataFrame, selected_series: list[str]) -> pd.DataFrame:
+    if yield_curve_df.empty:
+        return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"])
+
+    base = yield_curve_df.copy()
+    if selected_series:
+        base = base[base["curve_type"].isin(selected_series)].copy()
+
+    nominal = yield_curve_df[yield_curve_df["curve_type"] == "Nominal"][["maturity_years", "yield_percent", "curve_date"]].copy()
+    real = yield_curve_df[yield_curve_df["curve_type"] == "Real"][["maturity_years", "yield_percent", "curve_date"]].copy()
+    nominal = nominal.rename(columns={"yield_percent": "nominal_yield", "curve_date": "nominal_date"})
+    real = real.rename(columns={"yield_percent": "real_yield", "curve_date": "real_date"})
+    if not nominal.empty and not real.empty:
+        nominal_sorted = nominal.sort_values("maturity_years").dropna(subset=["maturity_years", "nominal_yield"])
+        real_sorted = real.sort_values("maturity_years").dropna(subset=["maturity_years", "real_yield"])
+        interpolated_nominal = np.interp(
+            real_sorted["maturity_years"].to_numpy(),
+            nominal_sorted["maturity_years"].to_numpy(),
+            nominal_sorted["nominal_yield"].to_numpy(),
+        )
+        bei = real_sorted.copy()
+        bei["nominal_yield"] = interpolated_nominal
+        bei["nominal_date"] = nominal_sorted["nominal_date"].max()
+        bei["curve_type"] = "Breakeven inflation"
+        bei["yield_percent"] = (((1 + (bei["nominal_yield"] / 100.0)) / (1 + (bei["real_yield"] / 100.0))) - 1) * 100.0
+        bei["curve_date"] = bei[["nominal_date", "real_date"]].max(axis=1)
+        bei = bei[["maturity_years", "yield_percent", "curve_type", "curve_date"]]
+    else:
+        bei = pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"])
+
+    combined = pd.concat([base, bei], ignore_index=True)
+    if selected_series:
+        combined = combined[combined["curve_type"].isin(selected_series)].copy()
+    return combined.sort_values(["curve_type", "maturity_years"]).reset_index(drop=True)
 
 
 # =====================================
@@ -2042,7 +2925,27 @@ st.markdown(
     }}
 
     .stTabs [data-baseweb="tab-list"] {{
-        display: none !important;
+        gap: 6px;
+    }}
+
+    .stTabs [data-baseweb="tab"] {{
+        color: {TEXT_GREY} !important;
+        background: #f3f3f3 !important;
+        border: 0.2px solid {MID_GREY} !important;
+        border-radius: 8px 8px 0 0 !important;
+        padding: 0.45rem 0.8rem !important;
+    }}
+
+    .stTabs [aria-selected="true"] {{
+        color: #111111 !important;
+        background: #ffffff !important;
+        border-bottom-color: #ffffff !important;
+        font-weight: 600 !important;
+    }}
+
+    .stTabs [data-baseweb="tab"] * {{
+        color: inherit !important;
+        -webkit-text-fill-color: inherit !important;
     }}
 
     .stMetric, .stMetric * {{
@@ -2096,7 +2999,7 @@ st.markdown(
         background: {CHART_BG_GREY} !important;
         border: 0.2px solid {MID_GREY} !important;
         border-radius: 12px !important;
-        padding: 10px 10px 6px 10px !important;
+        padding: 10px 18px 8px 12px !important;
         overflow: hidden !important;
     }}
 
@@ -2126,7 +3029,8 @@ st.markdown(
         padding: 10px 12px;
         text-align: center;
         font-weight: 600;
-        white-space: nowrap;
+        white-space: normal;
+        line-height: 1.2;
         overflow: hidden;
         text-overflow: ellipsis;
     }}
@@ -2246,6 +3150,16 @@ asset_coverage_diag = build_asset_coverage_table(
 mapping_diag = build_mapping_diagnostics_table(mapping, ts)
 live_price_diag = build_live_price_diagnostics(live_prices)
 ons_fetch_summary, ons_fetch_preview = build_ons_fetch_diagnostics(ONS_CPI_INDEX_CSV_URL)
+yield_curve_df, boe_yield_summary, boe_yield_preview = build_boe_yield_curve_diagnostics(
+    BOE_YIELD_CURVE_ZIP_URL,
+    DIVIDENDDATA_INDEX_LINKED_GILTS_URL,
+)
+asset_style_map = (
+    mapping.drop_duplicates(subset=["asset_class"], keep="last")
+    .set_index("asset_class")
+    .get("growth_defensive", pd.Series(dtype=float))
+    .to_dict()
+)
 
 
 # =====================================
@@ -2279,6 +3193,22 @@ with st.sidebar:
         type="primary" if st.session_state["top_page_selector"] == "Charts" else "secondary",
     ):
         st.session_state["top_page_selector"] = "Charts"
+        st.rerun()
+    if st.button(
+        PAGE_LABELS["Risk"],
+        key="sidebar_page_risk_btn",
+        use_container_width=True,
+        type="primary" if st.session_state["top_page_selector"] == "Risk" else "secondary",
+    ):
+        st.session_state["top_page_selector"] = "Risk"
+        st.rerun()
+    if st.button(
+        PAGE_LABELS["Yield"],
+        key="sidebar_page_yield_btn",
+        use_container_width=True,
+        type="primary" if st.session_state["top_page_selector"] == "Yield" else "secondary",
+    ):
+        st.session_state["top_page_selector"] = "Yield"
         st.rerun()
 
 st.markdown('<div class="top-header-grid">', unsafe_allow_html=True)
@@ -2540,7 +3470,7 @@ if page_name == "Dashboard":
         unsafe_allow_html=True,
     )
 
-else:
+elif page_name == "Charts":
     detail_return_basis = st.session_state.get("detail_return_basis_toolbar", "Nominal")
     detail_period = st.session_state.get("detail_period_toolbar", "YTD")
 
@@ -2663,11 +3593,9 @@ else:
     if growth_df.empty:
         st.info("No chart data available for the current selection.")
     else:
-        chart_col, _ = st.columns([0.985, 0.015])
-        with chart_col:
-            st.altair_chart(build_chart(growth_df, selected_assets, detail_period), width="stretch")
+        st.altair_chart(build_chart(growth_df, selected_assets, detail_period), width="stretch")
 
-    st.markdown('<div class="page-section-title">Annualised returns table</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-section-title">Annualised returns</div>', unsafe_allow_html=True)
     returns_display_df = (
         displayed_returns_charts_df[displayed_returns_charts_df["asset_class"].isin(selected_assets)][["asset_class"] + RETURNS_TABLE_PERIODS]
         if selected_assets else displayed_returns_charts_df[["asset_class"] + RETURNS_TABLE_PERIODS]
@@ -2700,6 +3628,243 @@ else:
         f'<div class="methodology-text">{get_methodology_paragraph("Charts", False, "Major", effective_real_mode, inflation_source_note)}</div>',
         unsafe_allow_html=True,
     )
+
+elif page_name == "Risk":
+    risk_return_basis = st.session_state.get("risk_return_basis_toolbar", "Nominal")
+    risk_period = st.session_state.get("risk_period_toolbar", "10Y")
+
+    is_real_mode = risk_return_basis == "Real"
+    effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+
+    end_date_risk = get_dashboard_end_date(
+        stitched_series_map=stitched_series_map,
+        live_diag=live_diag,
+        inflation_levels=inflation_levels,
+        is_real_mode=effective_real_mode,
+    )
+
+    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+    toolbar_cols = st.columns([1.0, 2.4, 2.6])
+
+    with toolbar_cols[0]:
+        st.markdown('<div class="toolbar-label">Return basis</div>', unsafe_allow_html=True)
+        risk_return_basis = st.segmented_control(
+            label="Return basis",
+            options=["Nominal", "Real"],
+            default=st.session_state.get("risk_return_basis_toolbar", "Nominal"),
+            key="risk_return_basis_toolbar",
+            label_visibility="collapsed",
+        ) or "Nominal"
+
+    is_real_mode = risk_return_basis == "Real"
+    effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+
+    with toolbar_cols[1]:
+        st.markdown('<div class="toolbar-label">Risk period</div>', unsafe_allow_html=True)
+        period_cols = st.columns(6)
+        with period_cols[0]:
+            st.button("YTD", key="risk_period_ytd_disabled", disabled=True, use_container_width=True)
+        for idx, period_key in enumerate(RISK_PERIODS.keys(), start=1):
+            with period_cols[idx]:
+                if st.button(
+                    period_key,
+                    key=f"risk_period_{period_key}",
+                    use_container_width=True,
+                    type="primary" if risk_period == period_key else "secondary",
+                ):
+                    st.session_state["risk_period_toolbar"] = period_key
+                    st.rerun()
+
+    with toolbar_cols[2]:
+        st.markdown(
+            f"""
+            <div class="toolbar-meta">
+                Annualised risk / return in GBP to <b>{end_date_risk.strftime("%d/%m/%Y")}</b>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if is_real_mode and not effective_real_mode:
+        st.warning("Real mode selected but no usable UK inflation series was found. Falling back to nominal results.")
+
+    saved_risk_assets = st.session_state.get("risk_selected_assets", default_chart_assets)
+    saved_risk_assets = [a for a in saved_risk_assets if a in available_assets] or default_chart_assets
+
+    selected_assets = st.multiselect(
+        "Asset classes",
+        options=available_assets,
+        default=saved_risk_assets,
+        key="risk_selected_assets",
+    )
+
+    if not selected_assets:
+        st.info("Select at least one asset class to populate the chart and table.")
+        selected_assets = []
+
+    risk_series_map = {}
+    for asset_class, series in stitched_series_map.items():
+        risk_series = series
+        if effective_real_mode:
+            if inflation_levels is None or inflation_levels.dropna().empty:
+                continue
+            risk_series = build_real_level_series(series, inflation_levels)
+        risk_series_map[asset_class] = risk_series
+
+    risk_scatter_df = build_risk_scatter_df(
+        series_map=risk_series_map,
+        selected_assets=selected_assets,
+        end_date=end_date_risk,
+        period_key=st.session_state.get("risk_period_toolbar", risk_period),
+    )
+    risk_table_df = build_risk_metrics_table(
+        series_map=risk_series_map,
+        selected_assets=selected_assets,
+        end_date=end_date_risk,
+        period_keys=list(RISK_PERIODS.keys()),
+    )
+    risk_summary_df = build_risk_summary_table(
+        series_map=risk_series_map,
+        asset_style_map=asset_style_map,
+        selected_assets=selected_assets,
+        end_date=end_date_risk,
+        start_date=whole_period_start,
+    )
+    correlation_matrix_df = build_correlation_matrix_table(
+        series_map=risk_series_map,
+        selected_assets=selected_assets,
+        end_date=end_date_risk,
+        start_date=whole_period_start,
+    )
+
+    st.markdown('<div class="page-section-title">Volatility/return chart</div>', unsafe_allow_html=True)
+    if risk_scatter_df.empty:
+        st.info("No risk data available for the current selection.")
+    else:
+        st.altair_chart(build_risk_scatter_chart(risk_scatter_df, selected_assets), width="stretch")
+
+    st.markdown('<div class="page-section-title">Volatility/return table</div>', unsafe_allow_html=True)
+    risk_percent_cols = [c for c in risk_table_df.columns if c != "asset_class"]
+    st.markdown(
+        build_html_table(
+            risk_table_df,
+            percent_cols=risk_percent_cols,
+            conditional_cols=risk_percent_cols,
+            header_wrap_cols=risk_percent_cols,
+            invert_conditional_cols=[c for c in risk_percent_cols if c.endswith("Vol")],
+            rank_conditional_cols=[c for c in risk_percent_cols if c.endswith("Vol")],
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="page-section-title">Since inception risk metrics</div>', unsafe_allow_html=True)
+    risk_summary_display_df = risk_summary_df.copy()
+    ratio_cols = [
+        "Return/vol ratio",
+        "Sharpe ratio",
+        "Information ratio",
+        "Sortino ratio",
+        "Calmar ratio",
+    ]
+    for col in ratio_cols:
+        if col in risk_summary_display_df.columns:
+            risk_summary_display_df[col] = risk_summary_display_df[col].map(
+                lambda x: np.nan if pd.isna(x) else round(float(x), 2)
+            )
+
+    risk_summary_percent_cols = [
+        c for c in ["Period return", "Period vol", "Worst drawdown", "Tracking error"] if c in risk_summary_display_df.columns
+    ]
+    risk_summary_conditional_cols = [c for c in risk_summary_display_df.columns if c != "asset_class"]
+    st.markdown(
+        build_html_table(
+            risk_summary_display_df,
+            percent_cols=risk_summary_percent_cols,
+            conditional_cols=risk_summary_conditional_cols,
+            header_wrap_cols=risk_summary_conditional_cols,
+            invert_conditional_cols=["Period vol", "Tracking error"],
+            rank_conditional_cols=["Period vol", "Worst drawdown", "Tracking error"],
+            decimal_cols=ratio_cols,
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="page-section-title">Correlation matrix</div>', unsafe_allow_html=True)
+    correlation_cols = [c for c in correlation_matrix_df.columns if c != "asset_class"]
+    st.markdown(
+        build_html_table(
+            correlation_matrix_df,
+            conditional_cols=correlation_cols,
+            header_wrap_cols=correlation_cols,
+            decimal_cols=correlation_cols,
+            correlation_conditional_cols=correlation_cols,
+        ),
+        unsafe_allow_html=True,
+    )
+
+    risk_methodology = (
+        f"This tab shows annualised {'real' if effective_real_mode else 'nominal'} return and annualised volatility in GBP "
+        f"to <b>{end_date_risk.strftime('%d/%m/%Y')}</b>. Volatility is calculated from monthly returns and annualised using the square root of 12."
+    )
+    if effective_real_mode:
+        risk_methodology += f" Current inflation source: {inflation_source_note}."
+    risk_methodology += (
+        " Glossary: Return/vol ratio is annualised return divided by annualised volatility. "
+        "Sharpe ratio is excess return over Cash (GBP) divided by volatility. "
+        "Information ratio is excess return versus the assigned benchmark divided by tracking error. "
+        "Sortino ratio is return divided by downside deviation. "
+        "Worst drawdown is the largest peak-to-trough fall since common inception. "
+        "Calmar ratio is annualised return divided by the absolute worst drawdown. "
+        "Tracking error is the annualised standard deviation of monthly excess returns versus the assigned benchmark. "
+        "The assigned benchmark is Global market for growth assets and Cash (GBP) for defensive assets."
+    )
+    st.markdown(f'<div class="methodology-text">{risk_methodology}</div>', unsafe_allow_html=True)
+
+else:
+    st.markdown('<div class="page-section-title">Yield curves</div>', unsafe_allow_html=True)
+    selected_yield_series = st.multiselect(
+        "Curve series",
+        options=["Nominal", "Real", "Breakeven inflation"],
+        default=st.session_state.get("yield_selected_series", ["Nominal", "Real", "Breakeven inflation"]),
+        key="yield_selected_series",
+    )
+    boe_fetch_ok = (
+        not boe_yield_summary.empty
+        and "Fetch status" in boe_yield_summary["metric"].values
+        and boe_yield_summary.loc[boe_yield_summary["metric"] == "Fetch status", "value"].astype(str).iloc[0] == "OK"
+    )
+    yield_curve_display_df = build_yield_curve_display_df(yield_curve_df, selected_yield_series)
+    has_curve_points = not yield_curve_display_df.empty
+
+    if not boe_fetch_ok and not has_curve_points:
+        st.warning("Bank of England yield-curve data could not be loaded. See diagnostics for details.")
+    else:
+        latest_dates = (
+            yield_curve_display_df.groupby("curve_type")["curve_date"]
+            .max()
+            .dropna()
+            .sort_index()
+        ) if has_curve_points else pd.Series(dtype="datetime64[ns]")
+        latest_text = " | ".join(
+            [f"{curve}: {pd.Timestamp(curve_date).strftime('%d/%m/%Y')}" for curve, curve_date in latest_dates.items()]
+        ) if not latest_dates.empty else ""
+        if latest_text:
+            st.markdown(
+                f'<div class="toolbar-meta" style="text-align:left; padding-top:0; margin-bottom:10px;">Latest curve dates: <b>{latest_text}</b></div>',
+                unsafe_allow_html=True,
+            )
+        if has_curve_points:
+            st.altair_chart(build_yield_curve_chart(yield_curve_display_df), width="stretch")
+        else:
+            st.info("BOE fetch succeeded but no curve points were available to plot. See diagnostics for details.")
+
+    yield_note = (
+        "Latest nominal and real UK spot curves are fetched from the Bank of England yield-curve archive. "
+        "The app reads the latest non-blank dated row from the '4. spot curve' sheet in the current-month nominal and real daily workbooks. "
+        "Where DividendData provides shorter-maturity index-linked gilts than the Bank of England real curve, those short-end gilt real yields are prepended to extend the real curve only below the first BOE real maturity. "
+        "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available."
+    )
+    st.markdown(f'<div class="methodology-text">{yield_note}</div>', unsafe_allow_html=True)
 
 
 # =====================================
@@ -2780,7 +3945,7 @@ if st.session_state["show_diagnostics"]:
         if inflation_debug_message:
             st.info(inflation_debug_message)
 
-        tabs = st.tabs(["Overview", "Dashboard stitching", "Chart series", "Returns", "Inflation", "Mapping & prices"])
+        tabs = st.tabs(["Overview", "Dashboard stitching", "Chart series", "Returns", "Inflation", "Yield curves", "Mapping & prices"])
 
         with tabs[0]:
             c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -3027,6 +4192,24 @@ if st.session_state["show_diagnostics"]:
                 st.write("No inflation series available.")
 
         with tabs[5]:
+            st.subheader("Bank of England yield-curve diagnostics")
+            st.dataframe(prepare_dataframe_for_display(boe_yield_summary), width="stretch", hide_index=True)
+            if not boe_yield_preview.empty:
+                st.dataframe(prepare_dataframe_for_display(boe_yield_preview), width="stretch", hide_index=True)
+                st.download_button(
+                    label="Download BOE yield diagnostics (CSV)",
+                    data=dataframe_to_csv_download(boe_yield_preview),
+                    file_name="boe_yield_curve_diagnostics.csv",
+                    mime="text/csv",
+                    key="download_boe_yield_diag_csv",
+                )
+            if not yield_curve_df.empty:
+                curve_preview = yield_curve_df.copy()
+                curve_preview["curve_date"] = pd.to_datetime(curve_preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+                st.subheader("Latest BOE spot-curve points")
+                st.dataframe(prepare_dataframe_for_display(curve_preview), width="stretch", hide_index=True)
+
+        with tabs[6]:
             mapping_tabs = st.tabs(["Validated mapping", "Raw mapping", "Live prices"])
 
             with mapping_tabs[0]:
