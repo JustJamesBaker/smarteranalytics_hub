@@ -1085,53 +1085,113 @@ def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFr
 
 def fetch_dividenddata_short_end_detail_fallback(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    preview_rows = []
     today = pd.Timestamp.today().normalize()
 
     for ticker in tickers:
         try:
             html = fetch_dividenddata_gilt_detail_html(ticker)
-        except Exception:
+        except Exception as exc:
+            preview_rows.append(
+                {
+                    "epic": ticker,
+                    "time_to_maturity": "",
+                    "real_yield_raw": "",
+                    "maturity_years": np.nan,
+                    "yield_percent": np.nan,
+                    "source": "DividendData detail",
+                    "status": f"Fetch failed: {type(exc).__name__}",
+                }
+            )
             continue
 
         text_parser = TextExtractingHTMLParser()
         text_parser.feed(html)
         text = " ".join(text_parser.parts)
 
-        maturity_match = re.search(r"Maturity Date[^0-9A-Za-z]+([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})", text, flags=re.IGNORECASE)
-        real_yield_match = re.search(r"Real Yield[^0-9\-]+(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
+        maturity_match = re.search(r"Maturity Date.*?([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})", text, flags=re.IGNORECASE)
+        real_yield_match = re.search(r"Real Yield.*?(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
         if real_yield_match is None:
-            real_yield_match = re.search(r"Current Yield[^0-9\-]+(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
+            real_yield_match = re.search(r"Current Yield.*?(-?\d+(?:\.\d+)?)%", text, flags=re.IGNORECASE)
 
         if maturity_match is None or real_yield_match is None:
+            preview_rows.append(
+                {
+                    "epic": ticker,
+                    "time_to_maturity": "",
+                    "real_yield_raw": "",
+                    "maturity_years": np.nan,
+                    "yield_percent": np.nan,
+                    "source": "DividendData detail",
+                    "status": "Parse failed",
+                }
+            )
             continue
 
         maturity_date = pd.to_datetime(maturity_match.group(1), format="%d-%b-%Y", errors="coerce")
         real_yield = pd.to_numeric(real_yield_match.group(1), errors="coerce")
         if pd.isna(maturity_date) or pd.isna(real_yield):
+            preview_rows.append(
+                {
+                    "epic": ticker,
+                    "time_to_maturity": "",
+                    "real_yield_raw": "",
+                    "maturity_years": np.nan,
+                    "yield_percent": np.nan,
+                    "source": "DividendData detail",
+                    "status": "Numeric/date conversion failed",
+                }
+            )
             continue
 
         maturity_years = max((pd.Timestamp(maturity_date) - today).days / 365.25, 0)
         if maturity_years <= 0:
+            preview_rows.append(
+                {
+                    "epic": ticker,
+                    "time_to_maturity": "",
+                    "real_yield_raw": "",
+                    "maturity_years": np.nan,
+                    "yield_percent": np.nan,
+                    "source": "DividendData detail",
+                    "status": "Maturity already passed",
+                }
+            )
             continue
 
-        rows.append(
+        row = {
+            "maturity_years": maturity_years,
+            "yield_percent": float(real_yield),
+            "curve_type": "Real",
+            "curve_date": today,
+            "source": "DividendData detail",
+            "epic": ticker,
+            "time_to_maturity": f"{maturity_years:.3f} years",
+            "real_yield_raw": f"{float(real_yield):.3f}%",
+            "status": "OK",
+        }
+        rows.append(row)
+        preview_rows.append(
             {
-                "maturity_years": maturity_years,
-                "yield_percent": float(real_yield),
-                "curve_type": "Real",
-                "curve_date": today,
-                "source": "DividendData detail",
                 "epic": ticker,
-                "time_to_maturity": f"{maturity_years:.3f} years",
-                "real_yield_raw": f"{float(real_yield):.3f}%",
+                "time_to_maturity": row["time_to_maturity"],
+                "real_yield_raw": row["real_yield_raw"],
+                "maturity_years": row["maturity_years"],
+                "yield_percent": row["yield_percent"],
+                "source": row["source"],
+                "status": "OK",
             }
         )
 
     if not rows:
-        raise ValueError("DividendData detail-page fallback could not parse any short-end index-linked gilts.")
+        preview = pd.DataFrame(preview_rows)
+        raise ValueError(
+            "DividendData detail-page fallback could not parse any short-end index-linked gilts. "
+            f"Attempted tickers: {', '.join(tickers)}"
+        )
 
     out = pd.DataFrame(rows).sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
-    preview = out[["epic", "time_to_maturity", "real_yield_raw", "maturity_years", "yield_percent", "source"]].copy()
+    preview = pd.DataFrame(preview_rows)
     return out[["maturity_years", "yield_percent", "curve_type", "curve_date", "source"]], preview
 
 
