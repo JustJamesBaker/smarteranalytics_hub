@@ -917,6 +917,17 @@ class SimpleHTMLTableParser(HTMLParser):
             self._current_table = []
 
 
+class TextExtractingHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        text = str(data).strip()
+        if text:
+            self.parts.append(text)
+
+
 def pick_boe_zip_member(member_names: list[str], target_text: str) -> str:
     target = target_text.strip().lower()
     candidates = [name for name in member_names if target in name.lower()]
@@ -963,6 +974,45 @@ def parse_time_to_maturity(value: object) -> float:
         return float(numeric) if pd.notna(numeric) else np.nan
 
     return years + (months / 12.0) + (days / 365.25)
+
+
+def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    parser = TextExtractingHTMLParser()
+    parser.feed(html)
+    text = "\n".join(parser.parts)
+
+    row_pattern = re.compile(
+        r"(?P<epic>[A-Z0-9]+)\s+.*?\s+(?P<maturity>\d+\s+years?(?:\s+\d+\s+days?)?)\s+£.*?(?P<real_yield>-?\d+(?:\.\d+)?)%",
+        flags=re.IGNORECASE,
+    )
+    matches = list(row_pattern.finditer(text))
+    if not matches:
+        raise ValueError("DividendData fallback text parser could not find index-linked gilt rows.")
+
+    rows = []
+    for match in matches:
+        maturity_text = match.group("maturity")
+        real_yield = pd.to_numeric(match.group("real_yield"), errors="coerce")
+        maturity_years = parse_time_to_maturity(maturity_text)
+        if pd.isna(real_yield) or pd.isna(maturity_years):
+            continue
+        rows.append(
+            {
+                "maturity_years": maturity_years,
+                "yield_percent": float(real_yield),
+                "curve_type": "Real",
+                "curve_date": pd.Timestamp.today().normalize(),
+                "source": "DividendData",
+                "epic": match.group("epic"),
+                "time_to_maturity": maturity_text,
+                "real_yield_raw": f"{match.group('real_yield')}%",
+            }
+        )
+
+    out = pd.DataFrame(rows).dropna(subset=["maturity_years", "yield_percent"])
+    out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
+    preview = out[["epic", "time_to_maturity", "real_yield_raw", "maturity_years", "yield_percent", "source"]].copy()
+    return out[["maturity_years", "yield_percent", "curve_type", "curve_date", "source"]], preview
 
 
 def parse_boe_spot_curve_workbook(workbook_bytes: bytes, curve_type: str) -> tuple[pd.DataFrame, pd.Timestamp, pd.DataFrame]:
@@ -1013,72 +1063,75 @@ def parse_boe_spot_curve_workbook(workbook_bytes: bytes, curve_type: str) -> tup
 
 def fetch_dividenddata_real_yield_extension(page_url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     html = fetch_dividenddata_html(page_url)
-    parser = SimpleHTMLTableParser()
-    parser.feed(html)
+    try:
+        parser = SimpleHTMLTableParser()
+        parser.feed(html)
 
-    target_rows = None
-    header = None
-    maturity_idx = None
-    real_yield_idx = None
-    for table_rows in parser.tables:
-        if len(table_rows) < 3:
-            continue
-        max_cols = max(len(r) for r in table_rows[:3])
-        candidate_headers = []
-        for depth in (1, 2, 3):
-            rows_to_merge = table_rows[:depth]
-            merged = []
-            for col_idx in range(max_cols):
-                parts = []
-                for row in rows_to_merge:
-                    if col_idx < len(row):
-                        cell = str(row[col_idx]).strip()
-                        if cell:
-                            parts.append(cell)
-                merged.append(" ".join(parts).strip())
-            candidate_headers.append((depth, merged))
+        target_rows = None
+        header = None
+        maturity_idx = None
+        real_yield_idx = None
+        for table_rows in parser.tables:
+            if len(table_rows) < 3:
+                continue
+            max_cols = max(len(r) for r in table_rows[:3])
+            candidate_headers = []
+            for depth in (1, 2, 3):
+                rows_to_merge = table_rows[:depth]
+                merged = []
+                for col_idx in range(max_cols):
+                    parts = []
+                    for row in rows_to_merge:
+                        if col_idx < len(row):
+                            cell = str(row[col_idx]).strip()
+                            if cell:
+                                parts.append(cell)
+                    merged.append(" ".join(parts).strip())
+                candidate_headers.append((depth, merged))
 
-        for depth, merged_header in candidate_headers:
-            header_lookup = {col.lower(): idx for idx, col in enumerate(merged_header)}
-            maturity_idx = next((idx for col, idx in header_lookup.items() if "time to maturity" in col), None)
-            real_yield_idx = next((idx for col, idx in header_lookup.items() if "real yield" in col), None)
-            if maturity_idx is not None and real_yield_idx is not None:
-                target_rows = table_rows[depth:]
-                header = merged_header
+            for depth, merged_header in candidate_headers:
+                header_lookup = {col.lower(): idx for idx, col in enumerate(merged_header)}
+                maturity_idx = next((idx for col, idx in header_lookup.items() if "time to maturity" in col), None)
+                real_yield_idx = next((idx for col, idx in header_lookup.items() if "real yield" in col), None)
+                if maturity_idx is not None and real_yield_idx is not None:
+                    target_rows = table_rows[depth:]
+                    header = merged_header
+                    break
+            if target_rows is not None:
                 break
-        if target_rows is not None:
-            break
 
-    if not target_rows or header is None or maturity_idx is None or real_yield_idx is None:
-        raise ValueError("DividendData table with 'Time to Maturity' and 'Real Yield' columns was not found.")
+        if not target_rows or header is None or maturity_idx is None or real_yield_idx is None:
+            raise ValueError("DividendData table with 'Time to Maturity' and 'Real Yield' columns was not found.")
 
-    body = target_rows
-    table = pd.DataFrame(body, columns=header)
-    maturity_col = header[maturity_idx]
-    real_yield_col = header[real_yield_idx]
-    out = pd.DataFrame(
-        {
-            "maturity_years": table[maturity_col].map(parse_time_to_maturity),
-            "yield_percent": pd.to_numeric(
-                table[real_yield_col].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
-                errors="coerce",
-            ),
-            "curve_type": "Real",
-            "curve_date": pd.Timestamp.today().normalize(),
-            "source": "DividendData",
-        }
-    ).dropna(subset=["maturity_years", "yield_percent"])
-    out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
+        body = target_rows
+        table = pd.DataFrame(body, columns=header)
+        maturity_col = header[maturity_idx]
+        real_yield_col = header[real_yield_idx]
+        out = pd.DataFrame(
+            {
+                "maturity_years": table[maturity_col].map(parse_time_to_maturity),
+                "yield_percent": pd.to_numeric(
+                    table[real_yield_col].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
+                    errors="coerce",
+                ),
+                "curve_type": "Real",
+                "curve_date": pd.Timestamp.today().normalize(),
+                "source": "DividendData",
+            }
+        ).dropna(subset=["maturity_years", "yield_percent"])
+        out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
 
-    preview = table[[maturity_col, real_yield_col]].copy()
-    preview.columns = ["time_to_maturity", "real_yield_raw"]
-    preview["maturity_years"] = preview["time_to_maturity"].map(parse_time_to_maturity)
-    preview["yield_percent"] = pd.to_numeric(
-        preview["real_yield_raw"].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
-        errors="coerce",
-    )
-    preview["source"] = "DividendData"
-    return out, preview
+        preview = table[[maturity_col, real_yield_col]].copy()
+        preview.columns = ["time_to_maturity", "real_yield_raw"]
+        preview["maturity_years"] = preview["time_to_maturity"].map(parse_time_to_maturity)
+        preview["yield_percent"] = pd.to_numeric(
+            preview["real_yield_raw"].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        preview["source"] = "DividendData"
+        return out, preview
+    except Exception:
+        return parse_dividenddata_text_fallback(html)
 
 
 def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
