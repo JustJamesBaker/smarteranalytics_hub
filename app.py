@@ -47,6 +47,7 @@ PAGE_LABELS = {
     "Dashboard": "Market snapshot",
     "Charts": "Performance analysis",
     "Risk": "Risk analysis",
+    "Geo": "Geographic analysis",
     "Yield": "Yield curves",
 }
 DISPLAY_NAME_OVERRIDES = {
@@ -86,6 +87,7 @@ RISK_PERIODS = {
     "5Y": "5 Year",
     "10Y": "10 Year",
     "20Y": "20 Year",
+    "Max": "Maximum",
 }
 
 RETURNS_TABLE_PERIODS = ["YTD", "1Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "25Y", "Period"]
@@ -318,6 +320,26 @@ WORLD_GOVERNMENT_BONDS_COUNTRIES = [
     ("Spain", "/country/spain/"),
     ("Netherlands", "/country/netherlands/"),
 ]
+FX_DOWNLOAD_START = "2000-01-01"
+FX_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "SEK", "NOK"]
+FX_TICKER_SPECS = {
+    "EUR": ("EURUSD=X", "direct"),
+    "GBP": ("GBPUSD=X", "direct"),
+    "JPY": ("JPY=X", "inverse"),
+    "CHF": ("CHF=X", "inverse"),
+    "AUD": ("AUDUSD=X", "direct"),
+    "NZD": ("NZDUSD=X", "direct"),
+    "CAD": ("CAD=X", "inverse"),
+    "SEK": ("SEK=X", "inverse"),
+    "NOK": ("NOK=X", "inverse"),
+}
+FX_PERIODS = {
+    "YTD": "YTD",
+    "1Y": "1Y",
+    "3Y": "3Y",
+    "5Y": "5Y",
+    "10Y": "10Y",
+}
 
 DEFAULT_ASSET_ORDER = [
     "Global stocks",
@@ -486,6 +508,145 @@ def rank_heat_colour(value: float, vmin: float, vmax: float, low_is_good: bool =
     start = np.array([190, 30, 55])
     end = np.array([0, 170, 95])
     rgb = (start * (1 - norm) + end * norm).astype(int)
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def get_period_start_anchor(end_date: pd.Timestamp, period_key: str) -> pd.Timestamp:
+    end_date = pd.Timestamp(end_date)
+    if period_key == "YTD":
+        return pd.Timestamp(end_date.year - 1, 12, 31)
+    years_map = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10}
+    years = years_map.get(period_key)
+    return end_date - pd.DateOffset(years=years) if years is not None else end_date
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def fetch_fx_value_series() -> pd.DataFrame:
+    tickers = tuple(sorted(spec[0] for spec in FX_TICKER_SPECS.values()))
+    raw_prices = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if raw_prices.empty:
+        return pd.DataFrame()
+
+    fx_frames = []
+    for currency, (ticker, mode) in FX_TICKER_SPECS.items():
+        if ticker not in raw_prices.columns:
+            continue
+        series = pd.to_numeric(raw_prices[ticker], errors="coerce").dropna().sort_index()
+        if series.empty:
+            continue
+        if mode == "inverse":
+            series = (1.0 / series).replace([np.inf, -np.inf], np.nan).dropna()
+        series.name = currency
+        fx_frames.append(series)
+
+    if not fx_frames:
+        return pd.DataFrame()
+
+    fx_df = pd.concat(fx_frames, axis=1).sort_index().ffill()
+    fx_df["USD"] = 1.0
+    fx_df = fx_df.reindex(columns=FX_CURRENCIES)
+    fx_df["USD"] = 1.0
+    return fx_df.sort_index().ffill()
+
+
+def build_currency_performance_matrix(fx_values_df: pd.DataFrame, period_key: str) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    if fx_values_df.empty:
+        return pd.DataFrame(), None
+
+    last_dates = [
+        pd.Timestamp(fx_values_df[c].dropna().index.max())
+        for c in fx_values_df.columns
+        if c in fx_values_df.columns and not fx_values_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return pd.DataFrame(), None
+
+    end_date = min(last_dates)
+    start_anchor = get_period_start_anchor(end_date, period_key)
+    rows = []
+
+    for row_currency in FX_CURRENCIES:
+        row = {"currency": row_currency}
+        row_series = fx_values_df.get(row_currency, pd.Series(dtype=float)).dropna().sort_index()
+        for col_currency in FX_CURRENCIES:
+            if row_currency == col_currency:
+                row[col_currency] = np.nan
+                continue
+            col_series = fx_values_df.get(col_currency, pd.Series(dtype=float)).dropna().sort_index()
+            if row_series.empty or col_series.empty:
+                row[col_currency] = np.nan
+                continue
+            cross_df = pd.concat([row_series.rename("row"), col_series.rename("col")], axis=1).sort_index().ffill().dropna()
+            if cross_df.empty:
+                row[col_currency] = np.nan
+                continue
+            cross_series = (cross_df["row"] / cross_df["col"]).dropna()
+            row[col_currency] = calc_period_return(cross_series, end_date, period_key, whole_period_start=start_anchor)
+        rows.append(row)
+
+    return pd.DataFrame(rows), end_date
+
+
+def build_currency_matrix_html(matrix_df: pd.DataFrame) -> str:
+    if matrix_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No currency data available.</div></div>'
+
+    display_df = matrix_df.copy().rename(columns={"currency": ""})
+    numeric_values = pd.to_numeric(matrix_df.drop(columns="currency").stack(), errors="coerce").dropna()
+    vmin = float(numeric_values.min()) if not numeric_values.empty else -0.05
+    vmax = float(numeric_values.max()) if not numeric_values.empty else 0.05
+    cols = list(display_df.columns)
+    first_col_width = 10.5
+    other_width = (100 - first_col_width) / (len(cols) - 1) if len(cols) > 1 else 100
+
+    colgroup = "".join(
+        [f'<col style="width:{first_col_width if idx == 0 else other_width:.4f}%;">' for idx, _ in enumerate(cols)]
+    )
+    thead = "".join([f"<th>{col}</th>" for col in cols])
+    body_rows = []
+
+    for _, row in display_df.iterrows():
+        cells = []
+        for idx, col in enumerate(cols):
+            value = row[col]
+            if idx == 0:
+                cells.append(f"<td><b>{value}</b></td>")
+                continue
+            if pd.isna(value):
+                cells.append('<td style="background:#9a9a9a;color:#ffffff;font-weight:600;"></td>')
+            else:
+                cells.append(
+                    f'<td style="background:{currency_heat_colour(float(value), vmin, vmax)};color:#111111;">{format_pct(float(value))}</td>'
+                )
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    return f"""
+    <div class="table-shell">
+        <table class="custom-data-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{''.join(body_rows)}</tbody>
+        </table>
+    </div>
+    """
+
+
+def currency_heat_colour(value: float, vmin: float, vmax: float) -> str:
+    if pd.isna(value):
+        return "#FFFFFF"
+
+    value = float(value)
+    white = np.array([255, 255, 255])
+    green = np.array([0, 170, 95])
+    red = np.array([190, 30, 55])
+
+    if value >= 0:
+        norm = 0.0 if vmax <= 0 else min(max(value / vmax, 0), 1)
+        rgb = (white * (1 - norm) + green * norm).astype(int)
+    else:
+        norm = 0.0 if vmin >= 0 else min(max(value / vmin, 0), 1)
+        rgb = (white * (1 - norm) + red * norm).astype(int)
+
     return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
 
 
@@ -2544,7 +2705,7 @@ def build_risk_summary_table(
             else np.nan
         )
         sharpe_ratio = (
-            (period_return - calc_period_return(cash_series, end_date, period_key)) / period_vol
+            (period_return - calc_period_return(cash_series, end_date, "Period", whole_period_start=start_date)) / period_vol
             if not cash_series.empty and pd.notna(period_vol) and period_vol > 0
             else np.nan
         )
@@ -2640,6 +2801,7 @@ def build_risk_metrics_table(
     selected_assets: list[str],
     end_date: pd.Timestamp,
     period_keys: list[str],
+    whole_period_start: pd.Timestamp,
 ) -> pd.DataFrame:
     rows = []
     assets = selected_assets if selected_assets else list(series_map.keys())
@@ -2651,9 +2813,13 @@ def build_risk_metrics_table(
         row = {"asset_class": asset}
         series = series_map[asset]
         for period_key in period_keys:
-            years = int(period_key.replace("Y", ""))
-            row[f"{period_key} Return"] = calc_period_return(series, end_date, period_key)
-            row[f"{period_key} Vol"] = calc_annualised_volatility(series, end_date, years)
+            if period_key == "Max":
+                row[f"{period_key} Return"] = calc_period_return(series, end_date, "Period", whole_period_start=whole_period_start)
+                row[f"{period_key} Vol"] = calc_annualised_volatility_from_start(series, end_date, whole_period_start)
+            else:
+                years = int(period_key.replace("Y", ""))
+                row[f"{period_key} Return"] = calc_period_return(series, end_date, period_key)
+                row[f"{period_key} Vol"] = calc_annualised_volatility(series, end_date, years)
         rows.append(row)
 
     return order_asset_rows(pd.DataFrame(rows))
@@ -2664,9 +2830,9 @@ def build_risk_scatter_df(
     selected_assets: list[str],
     end_date: pd.Timestamp,
     period_key: str,
+    whole_period_start: pd.Timestamp,
 ) -> pd.DataFrame:
     rows = []
-    years = int(period_key.replace("Y", ""))
     assets = selected_assets if selected_assets else list(series_map.keys())
 
     for asset in assets:
@@ -2674,8 +2840,13 @@ def build_risk_scatter_df(
             continue
 
         series = series_map[asset]
-        annual_return = calc_period_return(series, end_date, period_key)
-        annual_vol = calc_annualised_volatility(series, end_date, years)
+        if period_key == "Max":
+            annual_return = calc_period_return(series, end_date, "Period", whole_period_start=whole_period_start)
+            annual_vol = calc_annualised_volatility_from_start(series, end_date, whole_period_start)
+        else:
+            years = int(period_key.replace("Y", ""))
+            annual_return = calc_period_return(series, end_date, period_key)
+            annual_vol = calc_annualised_volatility(series, end_date, years)
         if pd.isna(annual_return) or pd.isna(annual_vol):
             continue
 
@@ -3947,6 +4118,72 @@ st.markdown(
         white-space: nowrap;
     }}
 
+    .st-key-market_snapshot_toolbar,
+    .st-key-performance_analysis_toolbar {{
+        border: 0.8px solid {MID_GREY} !important;
+        border-radius: 10px !important;
+        background: #ffffff !important;
+        padding: 10px 12px 8px 12px !important;
+        margin-bottom: 10px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar .toolbar-title,
+    .st-key-performance_analysis_toolbar .toolbar-title {{
+        margin-bottom: 6px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar .toolbar-label,
+    .st-key-market_snapshot_toolbar .toolbar-label-muted,
+    .st-key-performance_analysis_toolbar .toolbar-label,
+    .st-key-performance_analysis_toolbar .toolbar-label-muted {{
+        color: #444 !important;
+        margin-bottom: 5px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar [data-testid="stSegmentedControl"],
+    .st-key-performance_analysis_toolbar [data-testid="stSegmentedControl"] {{
+        min-height: 40px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar [data-testid="stSegmentedControl"] button,
+    .st-key-performance_analysis_toolbar [data-testid="stSegmentedControl"] button {{
+        min-height: 40px !important;
+        padding: 0 11px !important;
+        font-size: 13px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] > div,
+    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] > div {{
+        min-height: 40px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] [data-baseweb="input"],
+    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] [data-baseweb="input"] {{
+        min-height: 40px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] input,
+    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] input {{
+        min-height: 40px !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        font-size: 11.5px !important;
+    }}
+
+    .st-key-market_snapshot_toolbar .stDownloadButton button,
+    .st-key-performance_analysis_toolbar .stDownloadButton button {{
+        min-height: 40px !important;
+        width: 100% !important;
+        font-size: 13px !important;
+    }}
+
+    .snapshot-toolbar-note {{
+        font-size: 13px;
+        color: {TEXT_GREY};
+        margin: 0 0 14px 0;
+        line-height: 1.25;
+    }}
+
     .period-shell {{
         background: transparent;
         padding: 8px 8px 12px 8px;
@@ -4464,6 +4701,14 @@ with st.sidebar:
         st.session_state["top_page_selector"] = "Risk"
         st.rerun()
     if st.button(
+        PAGE_LABELS["Geo"],
+        key="sidebar_page_geo_btn",
+        use_container_width=True,
+        type="primary" if st.session_state["top_page_selector"] == "Geo" else "secondary",
+    ):
+        st.session_state["top_page_selector"] = "Geo"
+        st.rerun()
+    if st.button(
         PAGE_LABELS["Yield"],
         key="sidebar_page_yield_btn",
         use_container_width=True,
@@ -4511,63 +4756,69 @@ if page_name == "Dashboard":
     )
     dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
-    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([1.15, 1.15, 1.15, 1.2, 3.35])
+    with st.container(key="market_snapshot_toolbar"):
+        st.markdown('<div class="snapshot-toolbar-anchor"></div><div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([4.15, 2.45])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([0.91, 0.91, 0.91, 0.60, 0.44])
 
-    with toolbar_cols[0]:
-        st.markdown('<div class="toolbar-label">Display mode</div>', unsafe_allow_html=True)
-        display_mode = st.segmented_control(
-            label="Display mode",
-            options=["Absolute", "Relative"],
-            default=st.session_state.get("display_mode_toolbar", "Absolute"),
-            key="display_mode_toolbar",
-            label_visibility="collapsed",
-        ) or "Absolute"
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Display mode:</div>', unsafe_allow_html=True)
+                display_mode = st.segmented_control(
+                    label="Display mode",
+                    options=["Absolute", "Relative"],
+                    default=st.session_state.get("display_mode_toolbar", "Absolute"),
+                    key="display_mode_toolbar",
+                    label_visibility="collapsed",
+                ) or "Absolute"
 
-    is_relative_mode = display_mode == "Relative"
+            is_relative_mode = display_mode == "Relative"
 
-    with toolbar_cols[1]:
-        label_class = "toolbar-label" if is_relative_mode else "toolbar-label toolbar-label-muted"
-        st.markdown(f'<div class="{label_class}">Relative basis</div>', unsafe_allow_html=True)
-        relative_detail_mode = st.segmented_control(
-            label="Relative basis",
-            options=["Major", "Minor"],
-            default=st.session_state.get("relative_basis_toolbar", "Major"),
-            key="relative_basis_toolbar",
-            label_visibility="collapsed",
-        ) or "Major"
+            with toolbar_cols[1]:
+                st.markdown('<div class="toolbar-label">Relative basis:</div>', unsafe_allow_html=True)
+                relative_detail_mode = st.segmented_control(
+                    label="Relative basis",
+                    options=["Major", "Minor"],
+                    default=st.session_state.get("relative_basis_toolbar", "Major"),
+                    key="relative_basis_toolbar",
+                    label_visibility="collapsed",
+                ) or "Major"
 
-    with toolbar_cols[2]:
-        st.markdown('<div class="toolbar-label">Return basis</div>', unsafe_allow_html=True)
-        return_basis = st.segmented_control(
-            label="Return basis",
-            options=["Nominal", "Real"],
-            default=st.session_state.get("return_basis_toolbar", "Nominal"),
-            key="return_basis_toolbar",
-            label_visibility="collapsed",
-        ) or "Nominal"
+            with toolbar_cols[2]:
+                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+                return_basis = st.segmented_control(
+                    label="Return basis",
+                    options=["Nominal", "Real"],
+                    default=st.session_state.get("return_basis_toolbar", "Nominal"),
+                    key="return_basis_toolbar",
+                    label_visibility="collapsed",
+                ) or "Nominal"
 
-    is_real_mode = return_basis == "Real"
-    effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
-    end_date_dashboard = get_dashboard_end_date(
-        stitched_series_map=stitched_series_map,
-        live_diag=live_diag,
-        inflation_levels=inflation_levels,
-        is_real_mode=effective_real_mode,
-    )
-    dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
+            is_real_mode = return_basis == "Real"
+            effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+            end_date_dashboard = get_dashboard_end_date(
+                stitched_series_map=stitched_series_map,
+                live_diag=live_diag,
+                inflation_levels=inflation_levels,
+                is_real_mode=effective_real_mode,
+            )
+            dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
-    with toolbar_cols[3]:
-        st.markdown('<div class="toolbar-label">End date</div>', unsafe_allow_html=True)
-        dashboard_end_input = st.date_input(
-            "End date",
-            value=dashboard_saved_end.date(),
-            min_value=whole_period_start.date(),
-            max_value=end_date_dashboard.date(),
-            key="dashboard_end_date_filter",
-            label_visibility="collapsed",
-            format="DD/MM/YYYY",
-        )
+            with toolbar_cols[3]:
+                st.markdown('<div class="toolbar-label">End date:</div>', unsafe_allow_html=True)
+                dashboard_end_input = st.date_input(
+                    "End date",
+                    value=dashboard_saved_end.date(),
+                    min_value=whole_period_start.date(),
+                    max_value=end_date_dashboard.date(),
+                    key="dashboard_end_date_filter",
+                    label_visibility="collapsed",
+                    format="DD/MM/YYYY",
+                )
+
+            with toolbar_cols[4]:
+                st.markdown('<div class="toolbar-label">Report builder:</div>', unsafe_allow_html=True)
+                export_report_placeholder = st.empty()
 
     dashboard_end_date_selected = pd.Timestamp(dashboard_end_input)
     dashboard_series_window = filter_series_map_to_window(
@@ -4580,16 +4831,6 @@ if page_name == "Dashboard":
         if inflation_levels is not None
         else None
     )
-
-    with toolbar_cols[4]:
-        st.markdown(
-            f"""
-            <div class="toolbar-meta">
-                Annualised {"real" if effective_real_mode else "nominal"} returns in GBP to <b>{dashboard_end_date_selected.strftime("%d/%m/%Y")}</b>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     if is_real_mode and not effective_real_mode:
         st.warning("Real mode selected but no usable UK inflation series was found. Falling back to nominal results.")
@@ -4708,12 +4949,21 @@ if page_name == "Dashboard":
         further_notes=further_notes,
         snapshot_assets=snapshot_assets,
     )
-    st.download_button(
-        "Export report",
+    export_report_placeholder.download_button(
+        "Export",
         data=report_bytes,
         file_name=f"quarterly_market_metrics_{dashboard_end_date_selected.strftime('%Y_%m')}.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         key="export_quarterly_market_metrics_report",
+    )
+
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Annualised {"real" if effective_real_mode else "nominal"} returns in GBP to <b>{dashboard_end_date_selected.strftime("%d/%m/%Y")}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     lookup = build_lookup_table(displayed_returns_dashboard_df)
@@ -4890,18 +5140,21 @@ elif page_name == "Charts":
     charts_saved_end = max(charts_saved_start, min(charts_saved_end, end_date_charts))
     chart_period_options = list(CHART_PERIODS.keys()) + ["Custom"]
 
-    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([1.0, 1.7, 1.15, 1.15, 2.15])
+    with st.container(key="performance_analysis_toolbar"):
+        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([5.35, 1.25])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([0.92, 1.95, 0.66, 0.66])
 
-    with toolbar_cols[0]:
-        st.markdown('<div class="toolbar-label">Return basis</div>', unsafe_allow_html=True)
-        detail_return_basis = st.segmented_control(
-            label="Return basis",
-            options=["Nominal", "Real"],
-            default=st.session_state.get("detail_return_basis_toolbar", "Nominal"),
-            key="detail_return_basis_toolbar",
-            label_visibility="collapsed",
-        ) or "Nominal"
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+                detail_return_basis = st.segmented_control(
+                    label="Return basis",
+                    options=["Nominal", "Real"],
+                    default=st.session_state.get("detail_return_basis_toolbar", "Nominal"),
+                    key="detail_return_basis_toolbar",
+                    label_visibility="collapsed",
+                ) or "Nominal"
 
     is_real_mode = detail_return_basis == "Real"
     effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
@@ -4943,7 +5196,7 @@ elif page_name == "Charts":
     st.session_state["charts_end_date_filter"] = charts_active_end.date()
 
     with toolbar_cols[1]:
-        st.markdown('<div class="toolbar-label">Chart period</div>', unsafe_allow_html=True)
+        st.markdown('<div class="toolbar-label">Chart period:</div>', unsafe_allow_html=True)
         detail_period = st.segmented_control(
             label="Chart period",
             options=chart_period_options,
@@ -4952,7 +5205,7 @@ elif page_name == "Charts":
         ) or "YTD"
 
     with toolbar_cols[2]:
-        st.markdown('<div class="toolbar-label">Start date</div>', unsafe_allow_html=True)
+        st.markdown('<div class="toolbar-label">Start date:</div>', unsafe_allow_html=True)
         charts_start_input = st.date_input(
             "Start date",
             value=charts_active_start.date(),
@@ -4967,7 +5220,7 @@ elif page_name == "Charts":
     charts_start_date = pd.Timestamp(charts_start_input)
 
     with toolbar_cols[3]:
-        st.markdown('<div class="toolbar-label">End date</div>', unsafe_allow_html=True)
+        st.markdown('<div class="toolbar-label">End date:</div>', unsafe_allow_html=True)
         charts_end_input = st.date_input(
             "End date",
             value=charts_active_end.date(),
@@ -5000,15 +5253,14 @@ elif page_name == "Charts":
     )
     charts_whole_period_start = charts_start_date
 
-    with toolbar_cols[4]:
-        st.markdown(
-            f"""
-            <div class="toolbar-meta">
-                Return in GBP from <b>{charts_whole_period_start.strftime("%d/%m/%Y")}</b> to <b>{charts_end_date_selected.strftime("%d/%m/%Y")}</b>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Return in GBP from <b>{charts_whole_period_start.strftime("%d/%m/%Y")}</b> to <b>{charts_end_date_selected.strftime("%d/%m/%Y")}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if is_real_mode and not effective_real_mode:
         st.warning("Real mode selected but no usable UK inflation series was found. Falling back to nominal results.")
@@ -5133,47 +5385,43 @@ elif page_name == "Risk":
         is_real_mode=effective_real_mode,
     )
 
-    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([1.0, 2.4, 2.6])
+    with st.container(key="performance_analysis_toolbar"):
+        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([4.9, 1.7])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([0.92, 2.55])
 
-    with toolbar_cols[0]:
-        st.markdown('<div class="toolbar-label">Return basis</div>', unsafe_allow_html=True)
-        risk_return_basis = st.segmented_control(
-            label="Return basis",
-            options=["Nominal", "Real"],
-            default=st.session_state.get("risk_return_basis_toolbar", "Nominal"),
-            key="risk_return_basis_toolbar",
-            label_visibility="collapsed",
-        ) or "Nominal"
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+                risk_return_basis = st.segmented_control(
+                    label="Return basis",
+                    options=["Nominal", "Real"],
+                    default=st.session_state.get("risk_return_basis_toolbar", "Nominal"),
+                    key="risk_return_basis_toolbar",
+                    label_visibility="collapsed",
+                ) or "Nominal"
 
-    is_real_mode = risk_return_basis == "Real"
-    effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+            is_real_mode = risk_return_basis == "Real"
+            effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
 
-    with toolbar_cols[1]:
-        st.markdown('<div class="toolbar-label">Risk period</div>', unsafe_allow_html=True)
-        period_cols = st.columns(6)
-        with period_cols[0]:
-            st.button("YTD", key="risk_period_ytd_disabled", disabled=True, use_container_width=True)
-        for idx, period_key in enumerate(RISK_PERIODS.keys(), start=1):
-            with period_cols[idx]:
-                if st.button(
-                    period_key,
-                    key=f"risk_period_{period_key}",
-                    use_container_width=True,
-                    type="primary" if risk_period == period_key else "secondary",
-                ):
-                    st.session_state["risk_period_toolbar"] = period_key
-                    st.rerun()
+            with toolbar_cols[1]:
+                st.markdown('<div class="toolbar-label">Risk period:</div>', unsafe_allow_html=True)
+                risk_period = st.segmented_control(
+                    label="Risk period",
+                    options=list(RISK_PERIODS.keys()),
+                    default=st.session_state.get("risk_period_toolbar", "10Y"),
+                    key="risk_period_toolbar",
+                    label_visibility="collapsed",
+                ) or "10Y"
 
-    with toolbar_cols[2]:
-        st.markdown(
-            f"""
-            <div class="toolbar-meta">
-                Annualised risk / return in GBP to <b>{end_date_risk.strftime("%d/%m/%Y")}</b>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Annualised risk / return in GBP to <b>{end_date_risk.strftime("%d/%m/%Y")}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if is_real_mode and not effective_real_mode:
         st.warning("Real mode selected but no usable UK inflation series was found. Falling back to nominal results.")
@@ -5206,12 +5454,14 @@ elif page_name == "Risk":
         selected_assets=selected_assets,
         end_date=end_date_risk,
         period_key=st.session_state.get("risk_period_toolbar", risk_period),
+        whole_period_start=whole_period_start,
     )
     risk_table_df = build_risk_metrics_table(
         series_map=risk_series_map,
         selected_assets=selected_assets,
         end_date=end_date_risk,
         period_keys=list(RISK_PERIODS.keys()),
+        whole_period_start=whole_period_start,
     )
     risk_summary_df = build_risk_summary_table(
         series_map=risk_series_map,
@@ -5309,6 +5559,53 @@ elif page_name == "Risk":
         "The assigned benchmark is Global market for growth assets and Cash (GBP) for defensive assets."
     )
     st.markdown(f'<div class="methodology-text">{risk_methodology}</div>', unsafe_allow_html=True)
+
+elif page_name == "Geo":
+    fx_values_df = fetch_fx_value_series()
+    geo_period = st.session_state.get("geo_period_toolbar", "YTD")
+    currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, geo_period)
+
+    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+    toolbar_cols = st.columns([2.2, 2.8])
+
+    with toolbar_cols[0]:
+        st.markdown('<div class="toolbar-label">FX period</div>', unsafe_allow_html=True)
+        geo_period = st.segmented_control(
+            label="FX period",
+            options=list(FX_PERIODS.keys()),
+            default=st.session_state.get("geo_period_toolbar", "YTD"),
+            key="geo_period_toolbar",
+            label_visibility="collapsed",
+        ) or "YTD"
+
+    if geo_period != st.session_state.get("geo_period_toolbar", "YTD"):
+        st.session_state["geo_period_toolbar"] = geo_period
+
+    currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, geo_period)
+
+    with toolbar_cols[1]:
+        end_date_text = currency_end_date.strftime("%d/%m/%Y") if currency_end_date is not None else "-"
+        st.markdown(
+            f"""
+            <div class="toolbar-meta">
+                Daily FX performance matrix to <b>{end_date_text}</b>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="page-section-title">Currency performance</div>', unsafe_allow_html=True)
+    if currency_matrix_df.empty:
+        st.info("No FX data were available from yfinance for the selected matrix.")
+    else:
+        st.markdown(build_currency_matrix_html(currency_matrix_df), unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="methodology-text">This tab shows currency performance using daily FX rates from yfinance. '
+        'Each cell shows the performance of the row currency relative to the column currency over the selected period. '
+        'Positive values mean the row currency appreciated against the column currency.</div>',
+        unsafe_allow_html=True,
+    )
 
 else:
     global_yield_curve_df, global_yield_summary, global_yield_preview = build_global_yield_curve_diagnostics(
