@@ -1,17 +1,27 @@
 from pathlib import Path
 import base64
+import json
 from io import BytesIO, StringIO
 from html.parser import HTMLParser
 import re
 import zipfile
 
 import altair as alt
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from matplotlib import font_manager
+from matplotlib.ticker import AutoMinorLocator
 from pandas.tseries.offsets import MonthEnd
+from matplotlib.ticker import FuncFormatter
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt
 
 
 # =====================================
@@ -186,6 +196,14 @@ DISPLAY_GROUPS_RELATIVE_MINOR = [
     },
 ]
 
+REPORT_DISPLAY_GROUPS_ABSOLUTE = DISPLAY_GROUPS_ABSOLUTE[1:]
+REPORT_LABEL_OVERRIDES = {
+    "Cash": "Cash",
+    "UK Gilts (0-5)": "UK Gilts",
+    "UK IL Gilts (0-5)": "UK ILG (0-5)",
+    "Global bonds (0-5, GBP)": "GSDB (0-5)",
+}
+
 ASSET_CLASS_ALIASES = {
     "Global equity": "Global stocks",
     "Global stocks": "Global stocks",
@@ -287,6 +305,19 @@ BOE_YIELD_CURVE_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/sta
 DIVIDENDDATA_INDEX_LINKED_GILTS_URL = "https://www.dividenddata.co.uk/index-linked-gilts-prices-yields.py"
 DIVIDENDDATA_GILT_DETAIL_URL = "https://www.dividenddata.co.uk/gilts.py?ticker={ticker}"
 DIVIDENDDATA_SHORT_END_TICKERS = ["TR26", "T27", "T28", "T29", "TR31"]
+WORLD_GOVERNMENT_BONDS_BASE_URL = "https://www.worldgovernmentbonds.com"
+WORLD_GOVERNMENT_BONDS_COUNTRIES = [
+    ("United States", "/country/united-states/"),
+    ("China", "/country/china/"),
+    ("Japan", "/country/japan/"),
+    ("France", "/country/france/"),
+    ("United Kingdom", "/country/united-kingdom/"),
+    ("Germany", "/country/germany/"),
+    ("Canada", "/country/canada/"),
+    ("Italy", "/country/italy/"),
+    ("Spain", "/country/spain/"),
+    ("Netherlands", "/country/netherlands/"),
+]
 
 DEFAULT_ASSET_ORDER = [
     "Global stocks",
@@ -408,6 +439,37 @@ def heat_colour(value: float, vmin: float, vmax: float) -> str:
     dark = np.array([190, 30, 55])
     rgb = (light * (1 - norm) + dark * norm).astype(int)
     return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def get_series_map_bounds(series_map: dict[str, pd.Series]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    starts = []
+    ends = []
+    for series in series_map.values():
+        s = series.dropna().sort_index()
+        if s.empty:
+            continue
+        starts.append(pd.Timestamp(s.index.min()))
+        ends.append(pd.Timestamp(s.index.max()))
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def filter_series_by_date(series: pd.Series, start_date: pd.Timestamp | None, end_date: pd.Timestamp | None) -> pd.Series:
+    s = series.dropna().sort_index()
+    if start_date is not None:
+        s = s[s.index >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        s = s[s.index <= pd.Timestamp(end_date)]
+    return s
+
+
+def filter_series_map_by_date(
+    series_map: dict[str, pd.Series],
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> dict[str, pd.Series]:
+    return {asset: filter_series_by_date(series, start_date, end_date) for asset, series in series_map.items()}
 
 
 def rank_heat_colour(value: float, vmin: float, vmax: float, low_is_good: bool = False) -> str:
@@ -592,6 +654,66 @@ def get_dashboard_end_date(
     if is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty:
         end_date = min(end_date, pd.Timestamp(inflation_levels.dropna().index.max()))
     return end_date
+
+
+def get_series_map_date_bounds(series_map: dict[str, pd.Series]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    min_dates = []
+    max_dates = []
+    for series in series_map.values():
+        s = series.dropna().sort_index()
+        if s.empty:
+            continue
+        min_dates.append(pd.Timestamp(s.index.min()))
+        max_dates.append(pd.Timestamp(s.index.max()))
+    if not min_dates or not max_dates:
+        return None, None
+    return min(min_dates), max(max_dates)
+
+
+def filter_series_to_window(series: pd.Series, start_date: pd.Timestamp | None, end_date: pd.Timestamp | None) -> pd.Series:
+    out = series.dropna().sort_index()
+    if start_date is not None:
+        out = out[out.index >= start_date]
+    if end_date is not None:
+        out = out[out.index <= end_date]
+    return out
+
+
+def filter_series_map_to_window(
+    series_map: dict[str, pd.Series],
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> dict[str, pd.Series]:
+    return {
+        asset_class: filter_series_to_window(series, start_date, end_date)
+        for asset_class, series in series_map.items()
+    }
+
+
+def get_chart_period_start_date(period_key: str, end_date: pd.Timestamp, min_start_date: pd.Timestamp) -> pd.Timestamp:
+    end_date = pd.Timestamp(end_date).normalize()
+    min_start_date = pd.Timestamp(min_start_date).normalize()
+    if period_key == "YTD":
+        start_date = pd.Timestamp(end_date.year - 1, 12, 31)
+    else:
+        years_map = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10, "20Y": 20}
+        years = years_map.get(period_key)
+        start_date = end_date - pd.DateOffset(years=years) if years is not None else min_start_date
+    return max(min_start_date, pd.Timestamp(start_date).normalize())
+
+
+def match_chart_period_from_dates(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    min_start_date: pd.Timestamp,
+) -> str:
+    start_date = pd.Timestamp(start_date).normalize()
+    end_date = pd.Timestamp(end_date).normalize()
+    min_start_date = pd.Timestamp(min_start_date).normalize()
+    for period_key in CHART_PERIODS.keys():
+        if get_chart_period_start_date(period_key, end_date, min_start_date) == start_date:
+            return period_key
+    return "Custom"
 
 
 def convert_to_real_returns(nominal_returns_df: pd.DataFrame, inflation_returns_df: pd.DataFrame) -> pd.DataFrame:
@@ -879,6 +1001,39 @@ def fetch_dividenddata_gilt_detail_html(ticker: str) -> str:
     return fetch_dividenddata_html(DIVIDENDDATA_GILT_DETAIL_URL.format(ticker=ticker))
 
 
+def fetch_worldgovernmentbonds_html(page_url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+    response = requests.get(page_url, headers=headers, timeout=45)
+    response.raise_for_status()
+    return response.text
+
+
+def fetch_worldgovernmentbonds_country_payload(page_url: str, global_vars: dict) -> dict:
+    headers = {
+        "Origin": WORLD_GOVERNMENT_BONDS_BASE_URL,
+        "Referer": page_url,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    payload = {"GLOBALVAR": global_vars}
+    response = requests.post(
+        f"{WORLD_GOVERNMENT_BONDS_BASE_URL}/wp-json/country/v1/main",
+        headers=headers,
+        json=payload,
+        timeout=45,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 class SimpleHTMLTableParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -980,6 +1135,73 @@ def parse_time_to_maturity(value: object) -> float:
         return float(numeric) if pd.notna(numeric) else np.nan
 
     return years + (months / 12.0) + (days / 365.25)
+
+
+def parse_residual_maturity(value: object) -> float:
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip().lower()
+    if not text:
+        return np.nan
+
+    month_match = re.search(r"(\d+(?:\.\d+)?)\s*month", text)
+    year_match = re.search(r"(\d+(?:\.\d+)?)\s*year", text)
+    day_match = re.search(r"(\d+(?:\.\d+)?)\s*day", text)
+
+    years = float(year_match.group(1)) if year_match else 0.0
+    months = float(month_match.group(1)) if month_match else 0.0
+    days = float(day_match.group(1)) if day_match else 0.0
+    if years == 0 and months == 0 and days == 0:
+        numeric = pd.to_numeric(text, errors="coerce")
+        return float(numeric) if pd.notna(numeric) else np.nan
+    return years + (months / 12.0) + (days / 365.25)
+
+
+def extract_worldgovernmentbonds_js_global_vars(html: str) -> dict:
+    match = re.search(r"var\s+jsGlobalVars\s*=\s*(\{.*?\});", html, flags=re.DOTALL)
+    if match is None:
+        raise ValueError("WorldGovernmentBonds jsGlobalVars payload not found in country page HTML.")
+    return json.loads(match.group(1))
+
+
+def parse_worldgovernmentbonds_yield_curve_table(html: str, country_name: str, page_url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    parser = SimpleHTMLTableParser()
+    parser.feed(html)
+    rows = []
+
+    for table_rows in parser.tables:
+        for row in table_rows:
+            if len(row) < 3:
+                continue
+            maturity_text = str(row[1]).strip()
+            if not maturity_text:
+                continue
+            maturity_years = parse_residual_maturity(maturity_text)
+            yield_percent = pd.to_numeric(
+                str(row[2]).replace("%", "").replace(",", "").strip(),
+                errors="coerce",
+            )
+            if pd.isna(maturity_years) or pd.isna(yield_percent):
+                continue
+            rows.append(
+                {
+                    "country": country_name,
+                    "maturity_label": maturity_text,
+                    "maturity_years": float(maturity_years),
+                    "yield_percent": float(yield_percent),
+                    "curve_date": pd.Timestamp.today().normalize(),
+                    "source_url": page_url,
+                }
+            )
+
+    if not rows:
+        raise ValueError(f"WorldGovernmentBonds yield-curve rows not found for {country_name}.")
+
+    out = pd.DataFrame(rows).dropna(subset=["maturity_years", "yield_percent"])
+
+    out = out.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="first")
+    preview = out[["country", "maturity_label", "maturity_years", "yield_percent", "source_url"]].copy()
+    return out, preview
 
 
 def parse_dividenddata_text_fallback(html: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1387,6 +1609,66 @@ def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tu
             ]
         )
         return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"]), summary, pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def build_global_yield_curve_diagnostics(
+    base_url: str,
+    country_specs: list[tuple[str, str]],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    summary_rows = [
+        {"metric": "Fetch status", "value": "OK"},
+        {"metric": "Base URL", "value": base_url},
+        {"metric": "Countries requested", "value": int(len(country_specs))},
+    ]
+    preview_frames = []
+    curve_frames = []
+    success_count = 0
+
+    for country_name, path in country_specs:
+        page_url = f"{base_url.rstrip('/')}{path}"
+        try:
+            html = fetch_worldgovernmentbonds_html(page_url)
+            global_vars = extract_worldgovernmentbonds_js_global_vars(html)
+            payload = fetch_worldgovernmentbonds_country_payload(page_url, global_vars)
+            table_html = str(payload.get("mainTable", "")).strip()
+            if not table_html:
+                raise ValueError(f"WorldGovernmentBonds API returned no mainTable HTML for {country_name}.")
+
+            country_curve, country_preview = parse_worldgovernmentbonds_yield_curve_table(table_html, country_name, page_url)
+            last_data_desc = str(payload.get("lastDataValDesc", "")).strip()
+            curve_date = pd.to_datetime(last_data_desc, errors="coerce", dayfirst=True)
+            if pd.notna(curve_date):
+                country_curve["curve_date"] = pd.Timestamp(curve_date).normalize()
+            curve_frames.append(country_curve)
+            if pd.notna(curve_date):
+                country_preview["curve_date"] = pd.Timestamp(curve_date).strftime("%d/%m/%Y")
+            else:
+                country_preview["curve_date"] = last_data_desc
+            preview_frames.append(country_preview)
+            summary_rows.append({"metric": f"{country_name} status", "value": "OK"})
+            summary_rows.append({"metric": f"{country_name} points", "value": int(len(country_curve))})
+            summary_rows.append({"metric": f"{country_name} latest date", "value": last_data_desc or "-"})
+            success_count += 1
+        except Exception as exc:
+            summary_rows.append({"metric": f"{country_name} status", "value": f"{type(exc).__name__}: {exc}"})
+            summary_rows.append({"metric": f"{country_name} points", "value": 0})
+            summary_rows.append({"metric": f"{country_name} latest date", "value": "-"})
+
+    if success_count == 0:
+        summary_rows[0]["value"] = "Failed"
+
+    combined = (
+        pd.concat(curve_frames, ignore_index=True)
+        if curve_frames
+        else pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "curve_date", "source_url"])
+    )
+    preview = (
+        pd.concat(preview_frames, ignore_index=True)
+        if preview_frames
+        else pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "source_url"])
+    )
+    return combined, pd.DataFrame(summary_rows), preview
 
 
 def build_asset_coverage_table(
@@ -2089,6 +2371,11 @@ def build_growth_of_wealth_df(
 
         if period_key == "YTD":
             base_date, base_level = nearest_level_on_or_before(series, pd.Timestamp(end_date.year - 1, 12, 31))
+        elif period_key == "Custom":
+            if len(series) < 2:
+                continue
+            base_date = pd.Timestamp(series.index.min())
+            base_level = float(series.iloc[0])
         else:
             years = int(period_key.replace("Y", ""))
             base_date, base_level = nearest_level_on_or_before(series, end_date - pd.DateOffset(years=years))
@@ -2815,6 +3102,80 @@ def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
     )
 
 
+def build_global_yield_curve_chart(global_yield_curve_df: pd.DataFrame) -> alt.Chart:
+    if global_yield_curve_df.empty:
+        return alt.Chart(pd.DataFrame({"maturity_years": [], "yield_decimal": [], "country": []}))
+
+    chart_df = global_yield_curve_df.copy()
+    chart_df["yield_decimal"] = pd.to_numeric(chart_df["yield_percent"], errors="coerce") / 100.0
+    chart_df["maturity_years"] = pd.to_numeric(chart_df["maturity_years"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["maturity_years", "yield_decimal", "country"])
+    if chart_df.empty:
+        return alt.Chart(pd.DataFrame({"maturity_years": [], "yield_decimal": [], "country": []}))
+    legend_columns = max(1, int(chart_df["country"].nunique()))
+
+    return (
+        alt.Chart(chart_df)
+        .mark_line(point=False, strokeWidth=2.3)
+        .encode(
+            x=alt.X(
+                "maturity_years:Q",
+                title="Maturity (years)",
+                axis=alt.Axis(
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y(
+                "yield_decimal:Q",
+                title="Yield",
+                axis=alt.Axis(
+                    format=".0%",
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                ),
+            ),
+            color=alt.Color(
+                "country:N",
+                title=None,
+                legend=alt.Legend(
+                    labelColor=TEXT_GREY,
+                    orient="bottom",
+                    direction="horizontal",
+                    columns=legend_columns,
+                    labelLimit=200,
+                    symbolType="stroke",
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("country:N", title="Country"),
+                alt.Tooltip("maturity_years:Q", title="Maturity (years)", format=".2f"),
+                alt.Tooltip("yield_decimal:Q", title="Yield", format=".2%"),
+            ],
+        )
+        .properties(height=420, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .configure_view(stroke=None, fill=CHART_BG_GREY)
+        .configure_axis(labelFont="Calibri", titleFont="Calibri")
+        .configure_legend(
+            labelFont="Calibri",
+            titleFont="Calibri",
+            fillColor=CHART_BG_GREY,
+            strokeColor=CHART_BG_GREY,
+        )
+        .configure(background=CHART_BG_GREY)
+    )
+
+
 def build_yield_curve_display_df(yield_curve_df: pd.DataFrame, selected_series: list[str]) -> pd.DataFrame:
     if yield_curve_df.empty:
         return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"])
@@ -2849,6 +3210,642 @@ def build_yield_curve_display_df(yield_curve_df: pd.DataFrame, selected_series: 
     if selected_series:
         combined = combined[combined["curve_type"].isin(selected_series)].copy()
     return combined.sort_values(["curve_type", "maturity_years"]).reset_index(drop=True)
+
+
+def ppt_rgb(hex_color: str) -> RGBColor:
+    value = hex_color.lstrip("#")
+    return RGBColor(int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+
+
+@st.cache_data(show_spinner=False)
+def get_report_font_name() -> str:
+    return "Calibri Light"
+
+
+@st.cache_data(show_spinner=False)
+def get_matplotlib_report_font_name() -> str:
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+    for candidate in ["Calibri Light", "Calibri", "Arial", "DejaVu Sans"]:
+        if candidate in available_fonts:
+            return candidate
+    return "DejaVu Sans"
+
+
+def mpl_colour(value: str) -> str:
+    text = str(value).strip()
+    if text.startswith("rgb(") and text.endswith(")"):
+        inner = text[4:-1]
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) == 3:
+            try:
+                r, g, b = [int(float(p)) for p in parts]
+                return f"#{r:02x}{g:02x}{b:02x}"
+            except ValueError:
+                return "#e9e9e9"
+    return text
+
+
+def add_ppt_title(slide, title: str, subtitle: str | None = None) -> None:
+    report_font = get_report_font_name()
+    title_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.35), Inches(12.0), Inches(0.55))
+    p = title_box.text_frame.paragraphs[0]
+    run = p.add_run()
+    run.text = title
+    run.font.name = report_font
+    run.font.size = Pt(24)
+    run.font.bold = True
+    run.font.color.rgb = ppt_rgb(TEXT_GREY)
+    if subtitle:
+        subtitle_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.9), Inches(12.0), Inches(0.3))
+        p2 = subtitle_box.text_frame.paragraphs[0]
+        run2 = p2.add_run()
+        run2.text = subtitle
+        run2.font.name = report_font
+        run2.font.size = Pt(11)
+        run2.font.color.rgb = ppt_rgb(TEXT_GREY)
+
+
+def add_ppt_logo(slide, image_path: Path, left: float, top: float, width: float) -> None:
+    if image_path.exists():
+        slide.shapes.add_picture(str(image_path), Inches(left), Inches(top), width=Inches(width))
+
+
+def render_table_to_image(
+    df: pd.DataFrame,
+    title: str | None = None,
+    percent_cols: list[str] | None = None,
+    first_col_width: float | None = None,
+) -> BytesIO:
+    percent_cols = set(percent_cols or [])
+    report_font = get_matplotlib_report_font_name()
+    display_df = df.copy()
+    if "asset_class" in display_df.columns:
+        display_df["asset_class"] = display_df["asset_class"].map(display_name)
+        display_df = display_df.rename(columns={"asset_class": "Asset class"})
+
+    for col in display_df.columns:
+        source_col = "asset_class" if col == "Asset class" else col
+        if source_col in percent_cols:
+            display_df[col] = display_df[col].map(lambda x: format_pct(x) if pd.notna(x) else "-")
+        else:
+            display_df[col] = display_df[col].map(lambda x: "-" if pd.isna(x) else x)
+
+    rows, cols = display_df.shape
+    fig_h = max(2.2, 0.34 * (rows + 2))
+    fig_w = max(10.0, 1.15 * cols)
+    with plt.rc_context({"font.family": [report_font, "Calibri", "Arial", "DejaVu Sans"]}):
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=180)
+        ax.axis("off")
+        if title:
+            ax.set_title(title, fontsize=14, color=TEXT_GREY, loc="left", pad=12, fontweight="bold")
+
+        table = ax.table(
+            cellText=display_df.values,
+            colLabels=display_df.columns,
+            loc="upper left",
+            cellLoc="center",
+            colLoc="center",
+            bbox=[0, 0, 1, 0.92 if title else 1],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        if first_col_width is not None and len(display_df.columns) > 1:
+            other_width = (1.0 - first_col_width) / (len(display_df.columns) - 1)
+            for col_idx in range(len(display_df.columns)):
+                width = first_col_width if col_idx == 0 else other_width
+                for row_idx in range(len(display_df.index) + 1):
+                    table[(row_idx, col_idx)].set_width(width)
+
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor(MID_GREY)
+            cell.set_linewidth(0.35)
+            if row == 0:
+                cell.set_facecolor(LIGHT_GREY)
+                cell.set_text_props(weight="bold", color=TEXT_GREY)
+            else:
+                cell.set_facecolor(WHITE if row % 2 == 0 else "#fafafa")
+                if col == 0:
+                    cell.set_text_props(ha="left", color=TEXT_GREY)
+                else:
+                    cell.set_text_props(color=TEXT_GREY)
+
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def render_growth_chart_to_image(chart_df: pd.DataFrame) -> BytesIO:
+    report_font = get_matplotlib_report_font_name()
+    with plt.rc_context({"font.family": [report_font, "Calibri", "Arial", "DejaVu Sans"]}):
+        fig, ax = plt.subplots(figsize=(11.6, 5.5), dpi=180)
+        for asset_class, group in chart_df.groupby("asset_class"):
+            group = group.sort_values("Date")
+            ax.plot(group["Date"], group["Growth"], label=display_name(asset_class), linewidth=2.1)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+        ax.set_ylabel("Growth of wealth (GBP)", color=TEXT_GREY)
+        ax.grid(False)
+        ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.grid(which="minor", axis="y", linestyle=(0, (2, 4)), color=MID_GREY, linewidth=0.8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(MID_GREY)
+        ax.spines["bottom"].set_color(MID_GREY)
+        ax.tick_params(colors=TEXT_GREY, labelsize=10)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=4, frameon=False, fontsize=9)
+        fig.autofmt_xdate()
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def render_yield_chart_to_image(yield_df: pd.DataFrame) -> BytesIO:
+    report_font = get_matplotlib_report_font_name()
+    with plt.rc_context({"font.family": [report_font, "Calibri", "Arial", "DejaVu Sans"]}):
+        fig, ax = plt.subplots(figsize=(11.6, 5.5), dpi=180)
+        for curve_type, group in yield_df.groupby("curve_type"):
+            group = group.sort_values("maturity_years")
+            ax.plot(group["maturity_years"], pd.to_numeric(group["yield_percent"], errors="coerce") / 100.0, label=curve_type, linewidth=2.2)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+        ax.set_xlabel("Maturity (years)", color=TEXT_GREY)
+        ax.set_ylabel("Yield", color=TEXT_GREY)
+        ax.grid(axis="y", linestyle=(0, (2, 4)), color=MID_GREY, linewidth=0.8)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(MID_GREY)
+        ax.spines["bottom"].set_color(MID_GREY)
+        ax.tick_params(colors=TEXT_GREY, labelsize=10)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0%}"))
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=False, fontsize=9)
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def build_market_commentary_bullets(ytd_returns_df: pd.DataFrame) -> list[str]:
+    if ytd_returns_df.empty or "YTD" not in ytd_returns_df.columns:
+        return [
+            "Markets were mixed over the period, with equity and defensive returns diverging across regions.",
+            "Use this slide for an analyst summary of the most important market developments.",
+        ]
+
+    table = ytd_returns_df[["asset_class", "YTD"]].dropna().copy()
+    if table.empty:
+        return ["YTD performance commentary could not be generated from the selected end date."]
+
+    leaders = table.sort_values("YTD", ascending=False).head(3)
+    laggards = table.sort_values("YTD", ascending=True).head(2)
+    bullets = [
+        f"{display_name(row.asset_class)} returned {format_pct(row.YTD)} YTD." for row in leaders.itertuples()
+    ]
+    bullets.extend(
+        [f"{display_name(row.asset_class)} lagged at {format_pct(row.YTD)} YTD." for row in laggards.itertuples()]
+    )
+
+    cash_row = table[table["asset_class"] == "Cash (GBP)"]
+    if not cash_row.empty:
+        bullets.append(f"Cash (GBP) delivered {format_pct(float(cash_row['YTD'].iloc[0]))} YTD.")
+
+    return bullets[:7]
+
+
+def get_assets_from_display_groups(display_groups: list[dict]) -> list[str]:
+    assets = []
+    for group in display_groups:
+        for item in group.get("items", []):
+            if item not in assets:
+                assets.append(item)
+    return assets
+
+
+def wrap_tile_label(label_text: str, max_chars: int = 16) -> str:
+    text = str(label_text).strip()
+    if not text or len(text) <= max_chars:
+        return text
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return "\n".join(lines[:2])
+
+
+def get_report_tile_label(label_text: str) -> str:
+    text = str(label_text).strip()
+    return REPORT_LABEL_OVERRIDES.get(text, text)
+
+
+def render_snapshot_tiles_to_image(
+    returns_df: pd.DataFrame,
+    display_groups: list[dict],
+    period_order: list[str] | None = None,
+    layout_variant: str = "absolute",
+) -> BytesIO:
+    period_order = period_order or ["20Y", "10Y", "5Y", "YTD"]
+    lookup = build_lookup_table(returns_df)
+    report_font = get_matplotlib_report_font_name()
+    with plt.rc_context({"font.family": [report_font, "Calibri", "Arial", "DejaVu Sans"]}):
+        fig, axes = plt.subplots(1, len(period_order), figsize=(12.4, 6.7), dpi=180)
+        if len(period_order) == 1:
+            axes = [axes]
+
+        fig.patch.set_facecolor("white")
+        global_bottom = 1.0
+
+        for ax, period in zip(axes, period_order):
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.axis("off")
+
+            period_vals = returns_df[period].dropna() if period in returns_df.columns else pd.Series(dtype=float)
+            vmin = float(period_vals.min()) if len(period_vals) else -0.05
+            vmax = float(period_vals.max()) if len(period_vals) else 0.15
+
+            ax.text(0.5, 0.985, DASHBOARD_HORIZONS.get(period, period), ha="center", va="top", fontsize=16, color="black", fontweight="medium")
+
+            y = 0.93
+            group_gap = 0.02 if layout_variant == "relative_minor" else 0.018
+            title_gap = 0.026 if layout_variant == "relative_minor" else 0.028
+            tile_h_big = 0.074 if layout_variant == "relative_minor" else 0.072
+            tile_h_small = 0.068 if layout_variant == "relative_minor" else 0.067
+
+            for group in display_groups:
+                title = group["title"]
+                items = group["items"]
+                labels = group["labels"]
+
+                if title:
+                    ax.text(0.5, y, title, ha="center", va="top", fontsize=10.5, color="black", fontweight="medium")
+                    y -= title_gap
+                else:
+                    y -= 0.008
+
+                def draw_tile(x, y_top, w, h, value, label_text="", plain=False):
+                    colour = mpl_colour(heat_colour(value, vmin, vmax))
+                    rect = plt.Rectangle((x, y_top - h), w, h, facecolor=colour, edgecolor="none")
+                    ax.add_patch(rect)
+                    if label_text:
+                        display_label = get_report_tile_label(label_text)
+                        wrapped_label = wrap_tile_label(display_label, 18 if layout_variant == "relative_minor" else 15)
+                        line_count = wrapped_label.count("\n") + 1
+                        label_font = (
+                            6.9 if layout_variant == "relative_minor" and line_count > 1 else
+                            7.4 if layout_variant == "relative_minor" else
+                            6.9 if line_count > 1 else 7.4
+                        )
+                        ax.text(
+                            x + w / 2,
+                            y_top - (0.007 if layout_variant == "relative_minor" else 0.008),
+                            wrapped_label,
+                            ha="center",
+                            va="top",
+                            fontsize=7.8 if plain and layout_variant != "relative_minor" else label_font,
+                            color="black",
+                            fontweight="bold" if plain else "normal",
+                            linespacing=0.9,
+                        )
+                    else:
+                        line_count = 0
+                    ax.text(
+                        x + w / 2,
+                        y_top - h + (0.013 if layout_variant == "relative_minor" else 0.011),
+                        format_pct(value),
+                        ha="center",
+                        va="bottom",
+                        fontsize=11.2 if layout_variant == "relative_minor" else 12,
+                        color="white",
+                        fontweight="bold",
+                    )
+
+                if len(items) == 1:
+                    item = items[0]
+                    val = lookup.get(item, {}).get(period, np.nan)
+                    draw_tile(0.25, y, 0.5, tile_h_big, val, labels.get(item, ""), plain=False)
+                    y -= tile_h_big + group_gap
+                elif len(items) == 2:
+                    for idx, item in enumerate(items):
+                        val = lookup.get(item, {}).get(period, np.nan)
+                        draw_tile(0.03 + idx * 0.48, y, 0.44, tile_h_small, val, labels.get(item, item), plain=True)
+                    y -= tile_h_small + group_gap
+                elif len(items) == 3:
+                    broad = items[0]
+                    draw_tile(0.0325, y, 0.935, tile_h_big, lookup.get(broad, {}).get(period, np.nan), labels.get(broad, ""), plain=False)
+                    y -= tile_h_big + 0.01
+                    for idx, item in enumerate(items[1:]):
+                        draw_tile(0.03 + idx * 0.48, y, 0.44, tile_h_small, lookup.get(item, {}).get(period, np.nan), labels.get(item, ""), plain=False)
+                    y -= tile_h_small + group_gap
+                elif len(items) == 4:
+                    if layout_variant == "relative_minor":
+                        relative_tile_h = 0.084
+                        relative_gap = 0.018
+                        x_positions = [0.04, 0.525]
+                        widths = [0.405, 0.405]
+                        for row in range(2):
+                            for col in range(2):
+                                idx = row * 2 + col
+                                item = items[idx]
+                                draw_tile(
+                                    x_positions[col],
+                                    y,
+                                    widths[col],
+                                    relative_tile_h,
+                                    lookup.get(item, {}).get(period, np.nan),
+                                    labels.get(item, item),
+                                    plain=True,
+                                )
+                            y -= relative_tile_h + relative_gap
+                        y -= group_gap - relative_gap
+                    else:
+                        for row in range(2):
+                            for col in range(2):
+                                idx = row * 2 + col
+                                item = items[idx]
+                                draw_tile(0.03 + col * 0.48, y, 0.44, tile_h_small, lookup.get(item, {}).get(period, np.nan), labels.get(item, item), plain=True)
+                            y -= tile_h_small + 0.008
+                        y -= group_gap - 0.008
+                elif len(items) == 5:
+                    widths = [0.295, 0.295, 0.295]
+                    x_positions = [0.02, 0.3525, 0.685]
+                    for idx in range(3):
+                        item = items[idx]
+                        draw_tile(x_positions[idx], y, widths[idx], tile_h_small, lookup.get(item, {}).get(period, np.nan), labels.get(item, item), plain=True)
+                    y -= tile_h_small + 0.008
+                    for idx in range(2):
+                        item = items[idx + 3]
+                        draw_tile(0.16 + idx * 0.36, y, 0.31, tile_h_small, lookup.get(item, {}).get(period, np.nan), labels.get(item, item), plain=True)
+                    y -= tile_h_small + group_gap
+
+            global_bottom = min(global_bottom, y - 0.01)
+
+        if layout_variant == "relative_minor":
+            ylim_bottom = max(global_bottom, 0.42)
+            for ax in axes:
+                ax.set_ylim(ylim_bottom, 1.0)
+
+        plt.tight_layout(w_pad=0.7)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def render_relative_minor_snapshot_to_image(
+    returns_df: pd.DataFrame,
+    period_order: list[str] | None = None,
+) -> BytesIO:
+    period_order = period_order or ["20Y", "10Y", "5Y", "YTD"]
+    lookup = build_lookup_table(returns_df)
+    report_font = get_matplotlib_report_font_name()
+
+    with plt.rc_context({"font.family": [report_font, "Calibri", "Arial", "DejaVu Sans"]}):
+        fig, axes = plt.subplots(1, len(period_order), figsize=(12.4, 5.7), dpi=180)
+        if len(period_order) == 1:
+            axes = [axes]
+        fig.patch.set_facecolor("white")
+
+        for ax, period in zip(axes, period_order):
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.axis("off")
+
+            period_vals = returns_df[period].dropna() if period in returns_df.columns else pd.Series(dtype=float)
+            vmin = float(period_vals.min()) if len(period_vals) else -0.05
+            vmax = float(period_vals.max()) if len(period_vals) else 0.15
+            ax.text(0.5, 0.985, DASHBOARD_HORIZONS.get(period, period), ha="center", va="top", fontsize=16, color="black", fontweight="medium")
+
+            def draw_tile(x, y_top, w, h, value, label_text):
+                rect = plt.Rectangle((x, y_top - h), w, h, facecolor=mpl_colour(heat_colour(value, vmin, vmax)), edgecolor="none")
+                ax.add_patch(rect)
+                ax.text(
+                    x + w / 2,
+                    y_top - 0.012,
+                    get_report_tile_label(label_text),
+                    ha="center",
+                    va="top",
+                    fontsize=6.7,
+                    color="black",
+                    fontweight="bold",
+                )
+                ax.text(
+                    x + w / 2,
+                    y_top - h + 0.018,
+                    format_pct(value),
+                    ha="center",
+                    va="bottom",
+                    fontsize=10.6,
+                    color="white",
+                    fontweight="bold",
+                )
+
+            # Relative to DM
+            ax.text(0.5, 0.91, "Relative to DM", ha="center", va="top", fontsize=10.5, color="black", fontweight="medium")
+            y = 0.865
+            top_items = [
+                ("UK stocks", "UK"),
+                ("Emerging stocks", "EM"),
+                ("Developed REITs", "REIT"),
+            ]
+            for idx, (asset, label) in enumerate(top_items):
+                draw_tile(0.02 + idx * 0.325, y, 0.29, 0.08, lookup.get(asset, {}).get(period, np.nan), label)
+            y -= 0.096
+            bottom_items = [
+                ("Developed value stocks", "DM Value"),
+                ("Developed small stocks", "DM Small"),
+            ]
+            for idx, (asset, label) in enumerate(bottom_items):
+                draw_tile(0.18 + idx * 0.34, y, 0.29, 0.08, lookup.get(asset, {}).get(period, np.nan), label)
+
+            # Relative to EM
+            ax.text(0.5, 0.63, "Relative to EM", ha="center", va="top", fontsize=10.5, color="black", fontweight="medium")
+            y = 0.585
+            for idx, (asset, label) in enumerate([("Emerging value stocks", "EM Value"), ("Emerging small stocks", "EM Small")]):
+                draw_tile(0.06 + idx * 0.46, y, 0.38, 0.08, lookup.get(asset, {}).get(period, np.nan), label)
+
+            # Relative to UK
+            ax.text(0.5, 0.46, "Relative to UK", ha="center", va="top", fontsize=10.5, color="black", fontweight="medium")
+            y = 0.415
+            for idx, (asset, label) in enumerate([("UK value stocks", "UK Value"), ("UK small stocks", "UK Small")]):
+                draw_tile(0.06 + idx * 0.46, y, 0.38, 0.08, lookup.get(asset, {}).get(period, np.nan), label)
+
+            # Defensive block
+            y = 0.285
+            defensive_items = [
+                ("Cash (GBP)", "Cash"),
+                ("UK Gilts (0-5)", "UK Gilts"),
+                ("UK IL Gilts (0-5)", "UK ILG (0-5)"),
+                ("Global GBP hedged bonds (0-5)", "GSDB (0-5)"),
+            ]
+            for row in range(2):
+                for col in range(2):
+                    idx = row * 2 + col
+                    asset, label = defensive_items[idx]
+                    draw_tile(0.04 + col * 0.48, y, 0.40, 0.095, lookup.get(asset, {}).get(period, np.nan), label)
+                y -= 0.115
+
+        plt.tight_layout(w_pad=0.7)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@st.cache_data(show_spinner=False)
+def build_quarterly_market_metrics_report(
+    report_end_date_text: str,
+    report_end_date_long_text: str,
+    report_month_text: str,
+    nominal_abs_df: pd.DataFrame,
+    real_abs_df: pd.DataFrame,
+    relative_minor_df: pd.DataFrame,
+    returns_nominal_df: pd.DataFrame,
+    returns_real_df: pd.DataFrame,
+    growth_df: pd.DataFrame,
+    yield_df: pd.DataFrame,
+    bullet_points: list[str],
+    methodology_notes: list[str],
+    index_notes: list[str],
+    further_notes: list[str],
+    snapshot_assets: list[str],
+) -> bytes:
+    report_font = get_report_font_name()
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    # 1. Title
+    slide = prs.slides.add_slide(blank)
+    add_ppt_logo(slide, ALBION_LOGO_FILE, 0.65, 0.45, 2.0)
+    title_box = slide.shapes.add_textbox(Inches(0.8), Inches(2.0), Inches(11.7), Inches(1.2))
+    p = title_box.text_frame.paragraphs[0]
+    run = p.add_run()
+    run.text = "Quarterly Market Metrics"
+    run.font.name = report_font
+    run.font.size = Pt(28)
+    run.font.bold = True
+    run.font.color.rgb = ppt_rgb(TEXT_GREY)
+    p.alignment = PP_ALIGN.CENTER
+    subtitle = slide.shapes.add_textbox(Inches(0.8), Inches(3.05), Inches(11.7), Inches(0.5))
+    p2 = subtitle.text_frame.paragraphs[0]
+    run2 = p2.add_run()
+    run2.text = f"Data to {report_end_date_long_text}"
+    run2.font.name = report_font
+    run2.font.size = Pt(16)
+    run2.font.color.rgb = ppt_rgb(TEXT_GREY)
+    p2.alignment = PP_ALIGN.CENTER
+    add_ppt_logo(slide, POWERED_BY_FILE, 4.8, 6.45, 3.6)
+
+    # 2. Commentary
+    slide = prs.slides.add_slide(blank)
+    add_ppt_title(slide, "Market commentary")
+    box = slide.shapes.add_textbox(Inches(0.8), Inches(1.4), Inches(11.7), Inches(5.3))
+    tf = box.text_frame
+    for idx, bullet in enumerate(bullet_points or ["Add analyst commentary here."]):
+        p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
+        p.text = bullet
+        p.level = 0
+        for run in p.runs:
+            run.font.name = report_font
+        p.font.size = Pt(16)
+        p.font.color.rgb = ppt_rgb(TEXT_GREY)
+
+    snapshot_slide_specs = [
+        ("Absolute annualised nominal returns", nominal_abs_df, REPORT_DISPLAY_GROUPS_ABSOLUTE, "absolute", 0.90),
+        ("Absolute annualised real returns", real_abs_df, REPORT_DISPLAY_GROUPS_ABSOLUTE, "absolute", 0.90),
+    ]
+
+    for slide_title, df, groups, layout_variant, top_pos in snapshot_slide_specs:
+        slide = prs.slides.add_slide(blank)
+        add_ppt_title(slide, slide_title)
+        slide.shapes.add_picture(
+            render_snapshot_tiles_to_image(df, groups, layout_variant=layout_variant),
+            Inches(0.45),
+            Inches(top_pos),
+            width=Inches(12.35),
+        )
+
+    slide = prs.slides.add_slide(blank)
+    add_ppt_title(slide, "Relative annualised returns")
+    slide.shapes.add_picture(
+        render_relative_minor_snapshot_to_image(relative_minor_df),
+        Inches(0.45),
+        Inches(1.05),
+        width=Inches(12.35),
+    )
+
+    filtered_nominal = returns_nominal_df[returns_nominal_df["asset_class"].isin(snapshot_assets)].copy()
+    filtered_real = returns_real_df[returns_real_df["asset_class"].isin(snapshot_assets)].copy()
+    slide_specs = [
+        ("Annualised returns (nominal)", filtered_nominal, [c for c in filtered_nominal.columns if c != "asset_class"]),
+        ("Annualised returns (real)", filtered_real, [c for c in filtered_real.columns if c != "asset_class"]),
+    ]
+
+    for slide_title, df, percent_cols in slide_specs:
+        slide = prs.slides.add_slide(blank)
+        add_ppt_title(slide, slide_title)
+        img = render_table_to_image(df, percent_cols=percent_cols, first_col_width=0.24)
+        slide.shapes.add_picture(img, Inches(0.45), Inches(1.2), width=Inches(12.35))
+
+    slide = prs.slides.add_slide(blank)
+    add_ppt_title(slide, "Growth of wealth (10 years, nominal)")
+    slide.shapes.add_picture(render_growth_chart_to_image(growth_df), Inches(0.5), Inches(1.2), width=Inches(12.2))
+
+    slide = prs.slides.add_slide(blank)
+    add_ppt_title(slide, f"UK yield curve (as at {report_end_date_text})")
+    slide.shapes.add_picture(render_yield_chart_to_image(yield_df), Inches(0.5), Inches(1.2), width=Inches(12.2))
+
+    slide = prs.slides.add_slide(blank)
+    add_ppt_title(slide, "Important notes")
+    sections = [
+        ("Methodology", methodology_notes, (0.8, 1.3, 5.8, 2.0)),
+        ("Indices used", index_notes, (0.8, 3.45, 5.8, 2.7)),
+        ("Further information", further_notes, (6.75, 1.3, 5.75, 4.85)),
+    ]
+    for heading, lines, (left, top, width, height) in sections:
+        heading_box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(0.28))
+        hp = heading_box.text_frame.paragraphs[0]
+        hrun = hp.add_run()
+        hrun.text = heading
+        hrun.font.name = report_font
+        hrun.font.size = Pt(14)
+        hrun.font.bold = True
+        hrun.font.color.rgb = ppt_rgb(TEXT_GREY)
+
+        body_box = slide.shapes.add_textbox(Inches(left), Inches(top + 0.32), Inches(width), Inches(height))
+        tf_notes = body_box.text_frame
+        tf_notes.word_wrap = True
+        for idx, note in enumerate(lines):
+            p = tf_notes.paragraphs[0] if idx == 0 else tf_notes.add_paragraph()
+            p.text = note
+            p.level = 0
+            for run in p.runs:
+                run.font.name = report_font
+            p.font.size = Pt(11.5)
+            p.font.color.rgb = ppt_rgb(TEXT_GREY)
+
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
 
 
 # =====================================
@@ -3415,6 +4412,9 @@ yield_curve_df, boe_yield_summary, boe_yield_preview = build_boe_yield_curve_dia
     BOE_YIELD_CURVE_ZIP_URL,
     DIVIDENDDATA_INDEX_LINKED_GILTS_URL,
 )
+global_yield_curve_df = pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "curve_date", "source_url"])
+global_yield_summary = pd.DataFrame(columns=["metric", "value"])
+global_yield_preview = pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "source_url"])
 asset_style_map = (
     mapping.drop_duplicates(subset=["asset_class"], keep="last")
     .set_index("asset_class")
@@ -3484,6 +4484,8 @@ with right_col:
 st.markdown('</div>', unsafe_allow_html=True)
 
 page_name = st.session_state["top_page_selector"]
+if "show_diagnostics" not in st.session_state:
+    st.session_state["show_diagnostics"] = False
 
 
 # =====================================
@@ -3504,9 +4506,13 @@ if page_name == "Dashboard":
         inflation_levels=inflation_levels,
         is_real_mode=effective_real_mode,
     )
+    dashboard_saved_end = pd.Timestamp(
+        st.session_state.get("dashboard_end_date_filter", end_date_dashboard).strftime("%Y-%m-%d")
+    )
+    dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
     st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([1.15, 1.15, 1.15, 3.55])
+    toolbar_cols = st.columns([1.15, 1.15, 1.15, 1.2, 3.35])
 
     with toolbar_cols[0]:
         st.markdown('<div class="toolbar-label">Display mode</div>', unsafe_allow_html=True)
@@ -3543,12 +4549,43 @@ if page_name == "Dashboard":
 
     is_real_mode = return_basis == "Real"
     effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+    end_date_dashboard = get_dashboard_end_date(
+        stitched_series_map=stitched_series_map,
+        live_diag=live_diag,
+        inflation_levels=inflation_levels,
+        is_real_mode=effective_real_mode,
+    )
+    dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
     with toolbar_cols[3]:
+        st.markdown('<div class="toolbar-label">End date</div>', unsafe_allow_html=True)
+        dashboard_end_input = st.date_input(
+            "End date",
+            value=dashboard_saved_end.date(),
+            min_value=whole_period_start.date(),
+            max_value=end_date_dashboard.date(),
+            key="dashboard_end_date_filter",
+            label_visibility="collapsed",
+            format="DD/MM/YYYY",
+        )
+
+    dashboard_end_date_selected = pd.Timestamp(dashboard_end_input)
+    dashboard_series_window = filter_series_map_to_window(
+        stitched_series_map,
+        None,
+        dashboard_end_date_selected,
+    )
+    dashboard_inflation_window = (
+        filter_series_to_window(inflation_levels, None, dashboard_end_date_selected)
+        if inflation_levels is not None
+        else None
+    )
+
+    with toolbar_cols[4]:
         st.markdown(
             f"""
             <div class="toolbar-meta">
-                Annualised {"real" if effective_real_mode else "nominal"} returns in GBP to <b>{end_date_dashboard.strftime("%d/%m/%Y")}</b>
+                Annualised {"real" if effective_real_mode else "nominal"} returns in GBP to <b>{dashboard_end_date_selected.strftime("%d/%m/%Y")}</b>
             </div>
             """,
             unsafe_allow_html=True,
@@ -3560,7 +4597,7 @@ if page_name == "Dashboard":
     display_groups = get_display_groups(is_relative_mode, relative_detail_mode)
 
     absolute_returns_df = order_asset_rows(
-        calc_horizon_returns_from_levels(stitched_series_map, end_date_dashboard, list(DASHBOARD_HORIZONS.keys()))
+        calc_horizon_returns_from_levels(dashboard_series_window, dashboard_end_date_selected, list(DASHBOARD_HORIZONS.keys()))
     )
 
     if is_relative_mode:
@@ -3571,8 +4608,8 @@ if page_name == "Dashboard":
         nominal_display_returns_df = absolute_returns_df.copy()
 
     inflation_returns_dashboard_df = (
-        calc_horizon_returns_from_levels({"UK inflation": inflation_levels}, end_date_dashboard, list(DASHBOARD_HORIZONS.keys()))
-        if inflation_levels is not None and not inflation_levels.dropna().empty
+        calc_horizon_returns_from_levels({"UK inflation": dashboard_inflation_window}, dashboard_end_date_selected, list(DASHBOARD_HORIZONS.keys()))
+        if dashboard_inflation_window is not None and not dashboard_inflation_window.dropna().empty
         else pd.DataFrame()
     )
 
@@ -3580,6 +4617,103 @@ if page_name == "Dashboard":
         order_asset_rows(convert_to_real_returns(nominal_display_returns_df, inflation_returns_dashboard_df))
         if effective_real_mode
         else nominal_display_returns_df.copy()
+    )
+
+    report_nominal_abs_df = order_asset_rows(
+        calc_horizon_returns_from_levels(dashboard_series_window, dashboard_end_date_selected, list(DASHBOARD_HORIZONS.keys()))
+    )
+    report_real_abs_df = (
+        order_asset_rows(convert_to_real_returns(report_nominal_abs_df, inflation_returns_dashboard_df))
+        if not inflation_returns_dashboard_df.empty
+        else report_nominal_abs_df.copy()
+    )
+    report_relative_minor_df = order_asset_rows(
+        convert_to_relative_returns(report_nominal_abs_df, relative_detail_mode="Minor")
+    )
+    report_nominal_returns_df = order_asset_rows(
+        merge_return_tables(
+            calc_horizon_returns_from_levels(
+                dashboard_series_window,
+                dashboard_end_date_selected,
+                ["YTD", "1Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "25Y"],
+            ),
+            calc_whole_period_returns(dashboard_series_window, dashboard_end_date_selected, whole_period_start),
+        )
+    )
+    report_real_returns_df = (
+        order_asset_rows(
+            convert_to_real_returns(
+                report_nominal_returns_df,
+                order_asset_rows(
+                    merge_return_tables(
+                        calc_horizon_returns_from_levels(
+                            {"UK inflation": dashboard_inflation_window},
+                            dashboard_end_date_selected,
+                            ["YTD", "1Y", "3Y", "5Y", "7Y", "10Y", "15Y", "20Y", "25Y"],
+                        ),
+                        calc_whole_period_returns({"UK inflation": dashboard_inflation_window}, dashboard_end_date_selected, whole_period_start),
+                    )
+                ),
+            )
+        )
+        if dashboard_inflation_window is not None and not dashboard_inflation_window.dropna().empty
+        else report_nominal_returns_df.copy()
+    )
+    report_growth_df = build_growth_of_wealth_df(
+        chart_series_map=filter_series_map_to_window(chart_series_map, None, dashboard_end_date_selected),
+        selected_assets=default_chart_assets,
+        end_date=dashboard_end_date_selected,
+        period_key="10Y",
+        is_real_mode=False,
+        inflation_levels=None,
+    )
+    report_yield_df = build_yield_curve_display_df(yield_curve_df, ["Nominal", "Real", "Breakeven inflation"])
+    snapshot_assets = get_assets_from_display_groups(DISPLAY_GROUPS_ABSOLUTE)
+    report_index_mapping = (
+        mapping.drop_duplicates(subset=["asset_class"], keep="last")
+        .loc[lambda df: df["asset_class"].isin(snapshot_assets), ["asset_class", "index_name"]]
+        .copy()
+    )
+    report_index_notes = [
+        f"{display_name(row.asset_class)}: {row.index_name}"
+        for row in report_index_mapping.itertuples()
+        if str(row.index_name).strip()
+    ]
+    methodology_notes = [
+        f"Report end date: {dashboard_end_date_selected.strftime('%d/%m/%Y')}.",
+        "Snapshot slides use absolute nominal, absolute real, and relative minor annualised returns across 20Y, 10Y, 5Y and YTD.",
+        "Real returns are calculated using UK inflation via (1+asset return)/(1+inflation return)-1.",
+        "Growth of wealth uses nominal GBP series over 10 years and prioritises live daily history where available before stitched monthly index history.",
+        "UK nominal and real spot curves are sourced from the Bank of England. Short-end real yields may be extended using DividendData where available.",
+    ]
+    further_notes = [
+        "The app diagnostics section provides the underlying mapping, live ticker coverage, yield-curve source checks and inflation notes.",
+        "Relative minor mode shows growth assets relative to their configured local benchmark and defensive assets relative to cash.",
+        "More information on the Albion indices is available at smartersuccess.net/indices.",
+    ]
+    report_bytes = build_quarterly_market_metrics_report(
+        report_end_date_text=dashboard_end_date_selected.strftime("%d/%m/%Y"),
+        report_end_date_long_text=dashboard_end_date_selected.strftime("%d %B %Y"),
+        report_month_text=dashboard_end_date_selected.strftime("%B %Y"),
+        nominal_abs_df=report_nominal_abs_df[["asset_class", "20Y", "10Y", "5Y", "YTD"]],
+        real_abs_df=report_real_abs_df[["asset_class", "20Y", "10Y", "5Y", "YTD"]],
+        relative_minor_df=report_relative_minor_df[["asset_class", "20Y", "10Y", "5Y", "YTD"]],
+        returns_nominal_df=report_nominal_returns_df[["asset_class"] + RETURNS_TABLE_PERIODS],
+        returns_real_df=report_real_returns_df[["asset_class"] + RETURNS_TABLE_PERIODS],
+        growth_df=report_growth_df,
+        yield_df=report_yield_df,
+        bullet_points=build_market_commentary_bullets(report_nominal_abs_df),
+        methodology_notes=methodology_notes,
+        index_notes=report_index_notes,
+        further_notes=further_notes,
+        snapshot_assets=snapshot_assets,
+    )
+    st.download_button(
+        "Export report",
+        data=report_bytes,
+        file_name=f"quarterly_market_metrics_{dashboard_end_date_selected.strftime('%Y_%m')}.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        key="export_quarterly_market_metrics_report",
     )
 
     lookup = build_lookup_table(displayed_returns_dashboard_df)
@@ -3744,9 +4878,20 @@ elif page_name == "Charts":
         inflation_levels=inflation_levels,
         is_real_mode=effective_real_mode,
     )
+    charts_min_date, _ = get_series_map_date_bounds(chart_series_map)
+    charts_default_start = whole_period_start if charts_min_date is None else max(whole_period_start, charts_min_date)
+    charts_saved_start = pd.Timestamp(
+        st.session_state.get("charts_start_date_filter", charts_default_start).strftime("%Y-%m-%d")
+    )
+    charts_saved_end = pd.Timestamp(
+        st.session_state.get("charts_end_date_filter", end_date_charts).strftime("%Y-%m-%d")
+    )
+    charts_saved_start = max(charts_default_start, min(charts_saved_start, end_date_charts))
+    charts_saved_end = max(charts_saved_start, min(charts_saved_end, end_date_charts))
+    chart_period_options = list(CHART_PERIODS.keys()) + ["Custom"]
 
     st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([1.0, 2.35, 2.65])
+    toolbar_cols = st.columns([1.0, 1.7, 1.15, 1.15, 2.15])
 
     with toolbar_cols[0]:
         st.markdown('<div class="toolbar-label">Return basis</div>', unsafe_allow_html=True)
@@ -3760,22 +4905,106 @@ elif page_name == "Charts":
 
     is_real_mode = detail_return_basis == "Real"
     effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+    end_date_charts = get_dashboard_end_date(
+        stitched_series_map=stitched_series_map,
+        live_diag=live_diag,
+        inflation_levels=inflation_levels,
+        is_real_mode=effective_real_mode,
+    )
+    charts_saved_start = max(charts_default_start, min(charts_saved_start, end_date_charts))
+    charts_saved_end = max(charts_saved_start, min(charts_saved_end, end_date_charts))
+    detail_period = detail_period if detail_period in chart_period_options else "YTD"
+
+    prev_chart_period = st.session_state.get("_charts_prev_period")
+    prev_chart_start = st.session_state.get("_charts_prev_start_date")
+    prev_chart_end = st.session_state.get("_charts_prev_end_date")
+
+    charts_active_start = charts_saved_start.normalize()
+    charts_active_end = charts_saved_end.normalize()
+
+    start_changed = prev_chart_start is not None and charts_active_start != pd.Timestamp(prev_chart_start).normalize()
+    end_changed = prev_chart_end is not None and charts_active_end != pd.Timestamp(prev_chart_end).normalize()
+    period_changed = prev_chart_period is not None and detail_period != prev_chart_period
+
+    if prev_chart_period is None:
+        if detail_period == "Custom":
+            detail_period = match_chart_period_from_dates(charts_active_start, charts_active_end, charts_default_start)
+        if detail_period != "Custom":
+            charts_active_start = get_chart_period_start_date(detail_period, charts_active_end, charts_default_start)
+    elif period_changed and detail_period != "Custom":
+        charts_active_start = get_chart_period_start_date(detail_period, charts_active_end, charts_default_start)
+    elif end_changed and not start_changed and detail_period != "Custom":
+        charts_active_start = get_chart_period_start_date(detail_period, charts_active_end, charts_default_start)
+    elif start_changed or end_changed:
+        detail_period = match_chart_period_from_dates(charts_active_start, charts_active_end, charts_default_start)
+
+    st.session_state["detail_period_toolbar"] = detail_period
+    st.session_state["charts_start_date_filter"] = charts_active_start.date()
+    st.session_state["charts_end_date_filter"] = charts_active_end.date()
 
     with toolbar_cols[1]:
         st.markdown('<div class="toolbar-label">Chart period</div>', unsafe_allow_html=True)
         detail_period = st.segmented_control(
             label="Chart period",
-            options=list(CHART_PERIODS.keys()),
-            default=st.session_state.get("detail_period_toolbar", "YTD"),
+            options=chart_period_options,
             key="detail_period_toolbar",
             label_visibility="collapsed",
         ) or "YTD"
 
     with toolbar_cols[2]:
+        st.markdown('<div class="toolbar-label">Start date</div>', unsafe_allow_html=True)
+        charts_start_input = st.date_input(
+            "Start date",
+            value=charts_active_start.date(),
+            min_value=charts_default_start.date(),
+            max_value=end_date_charts.date(),
+            key="charts_start_date_filter",
+            label_visibility="collapsed",
+            format="DD/MM/YYYY",
+            disabled=detail_period != "Custom",
+        )
+
+    charts_start_date = pd.Timestamp(charts_start_input)
+
+    with toolbar_cols[3]:
+        st.markdown('<div class="toolbar-label">End date</div>', unsafe_allow_html=True)
+        charts_end_input = st.date_input(
+            "End date",
+            value=charts_active_end.date(),
+            min_value=charts_start_date.date(),
+            max_value=end_date_charts.date(),
+            key="charts_end_date_filter",
+            label_visibility="collapsed",
+            format="DD/MM/YYYY",
+            disabled=detail_period != "Custom",
+        )
+
+    charts_end_date_selected = pd.Timestamp(charts_end_input)
+    st.session_state["_charts_prev_period"] = detail_period
+    st.session_state["_charts_prev_start_date"] = charts_start_date.date()
+    st.session_state["_charts_prev_end_date"] = charts_end_date_selected.date()
+    chart_series_window = filter_series_map_to_window(
+        chart_series_map,
+        charts_start_date,
+        charts_end_date_selected,
+    )
+    stitched_series_window = filter_series_map_to_window(
+        stitched_series_map,
+        charts_start_date,
+        charts_end_date_selected,
+    )
+    charts_inflation_window = (
+        filter_series_to_window(inflation_levels, charts_start_date, charts_end_date_selected)
+        if inflation_levels is not None
+        else None
+    )
+    charts_whole_period_start = charts_start_date
+
+    with toolbar_cols[4]:
         st.markdown(
             f"""
             <div class="toolbar-meta">
-                Return in GBP from <b>{common_inception_text}</b> to <b>{end_date_charts.strftime("%d/%m/%Y")}</b>
+                Return in GBP from <b>{charts_whole_period_start.strftime("%d/%m/%Y")}</b> to <b>{charts_end_date_selected.strftime("%d/%m/%Y")}</b>
             </div>
             """,
             unsafe_allow_html=True,
@@ -3842,12 +5071,12 @@ elif page_name == "Charts":
         calendar_year_df = calendar_year_real_df
 
     growth_df = build_growth_of_wealth_df(
-        chart_series_map=chart_series_map,
+        chart_series_map=chart_series_window,
         selected_assets=selected_assets,
-        end_date=end_date_charts,
+        end_date=charts_end_date_selected,
         period_key=detail_period,
         is_real_mode=effective_real_mode,
-        inflation_levels=inflation_levels,
+        inflation_levels=charts_inflation_window,
     )
 
     st.markdown('<div class="page-section-title">Growth of wealth</div>', unsafe_allow_html=True)
@@ -4050,7 +5279,7 @@ elif page_name == "Risk":
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="page-section-title">Correlation matrix</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-section-title">Since inception correlation matrix</div>', unsafe_allow_html=True)
     correlation_cols = [c for c in correlation_matrix_df.columns if c != "asset_class"]
     st.markdown(
         build_html_table(
@@ -4082,7 +5311,11 @@ elif page_name == "Risk":
     st.markdown(f'<div class="methodology-text">{risk_methodology}</div>', unsafe_allow_html=True)
 
 else:
-    st.markdown('<div class="page-section-title">Yield curves</div>', unsafe_allow_html=True)
+    global_yield_curve_df, global_yield_summary, global_yield_preview = build_global_yield_curve_diagnostics(
+        WORLD_GOVERNMENT_BONDS_BASE_URL,
+        WORLD_GOVERNMENT_BONDS_COUNTRIES,
+    )
+    st.markdown('<div class="page-section-title">UK yield curve</div>', unsafe_allow_html=True)
     selected_yield_series = st.multiselect(
         "Curve series",
         options=["Nominal", "Real", "Breakeven inflation"],
@@ -4119,11 +5352,31 @@ else:
         else:
             st.info("BOE fetch succeeded but no curve points were available to plot. See diagnostics for details.")
 
+    st.markdown('<div class="page-section-title">Global yield curves</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="diag-note" style="margin-top:-4px; margin-bottom:10px;">'
+        'Source: WorldGovernmentBonds. These nominal curves come from a different provider and may not match the UK curve above exactly because of source methodology, market conventions, or update timing/date differences.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    global_fetch_ok = (
+        not global_yield_summary.empty
+        and "Fetch status" in global_yield_summary["metric"].values
+        and global_yield_summary.loc[global_yield_summary["metric"] == "Fetch status", "value"].astype(str).iloc[0] == "OK"
+    )
+    if not global_fetch_ok and global_yield_curve_df.empty:
+        st.warning("WorldGovernmentBonds yield-curve data could not be loaded. See diagnostics for details.")
+    elif global_yield_curve_df.empty:
+        st.info("WorldGovernmentBonds fetch succeeded but no country curve points were available to plot.")
+    else:
+        st.altair_chart(build_global_yield_curve_chart(global_yield_curve_df), width="stretch")
+
     yield_note = (
         "Latest nominal and real UK spot curves are fetched from the Bank of England yield-curve archive. "
         "The app reads the latest non-blank dated row from the '4. spot curve' sheet in the current-month nominal and real daily workbooks. "
         "Where DividendData provides shorter-maturity index-linked gilts than the Bank of England real curve, those short-end gilt real yields are prepended to extend the real curve only below the first BOE real maturity. "
-        "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available."
+        "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available. "
+        "The global chart fetches the latest nominal yield-curve tables from WorldGovernmentBonds country pages and plots the 'Last' annualised yield column for the ten largest government bond markets."
     )
     st.markdown(f'<div class="methodology-text">{yield_note}</div>', unsafe_allow_html=True)
 
@@ -4147,9 +5400,6 @@ if POWERED_BY_FILE.exists():
 # =====================================
 # DIAGNOSTICS
 # =====================================
-if "show_diagnostics" not in st.session_state:
-    st.session_state["show_diagnostics"] = False
-
 diag_label = (
     "▼ Diagnostics and underlying data"
     if st.session_state["show_diagnostics"]
@@ -4160,6 +5410,11 @@ if st.button(diag_label, key="diagnostics_toggle_button", use_container_width=Tr
     st.session_state["show_diagnostics"] = not st.session_state["show_diagnostics"]
 
 if st.session_state["show_diagnostics"]:
+    if global_yield_summary.empty:
+        global_yield_curve_df, global_yield_summary, global_yield_preview = build_global_yield_curve_diagnostics(
+            WORLD_GOVERNMENT_BONDS_BASE_URL,
+            WORLD_GOVERNMENT_BONDS_COUNTRIES,
+        )
     generic_end_date = get_dashboard_end_date(
         stitched_series_map=stitched_series_map,
         live_diag=live_diag,
@@ -4469,6 +5724,23 @@ if st.session_state["show_diagnostics"]:
                 curve_preview["curve_date"] = pd.to_datetime(curve_preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
                 st.subheader("Latest BOE spot-curve points")
                 st.dataframe(prepare_dataframe_for_display(curve_preview), width="stretch", hide_index=True)
+
+            st.subheader("WorldGovernmentBonds diagnostics")
+            st.dataframe(prepare_dataframe_for_display(global_yield_summary), width="stretch", hide_index=True)
+            if not global_yield_preview.empty:
+                st.dataframe(prepare_dataframe_for_display(global_yield_preview), width="stretch", hide_index=True)
+                st.download_button(
+                    label="Download global yield diagnostics (CSV)",
+                    data=dataframe_to_csv_download(global_yield_preview),
+                    file_name="global_yield_curve_diagnostics.csv",
+                    mime="text/csv",
+                    key="download_global_yield_diag_csv",
+                )
+            if not global_yield_curve_df.empty:
+                global_curve_preview = global_yield_curve_df.copy()
+                global_curve_preview["curve_date"] = pd.to_datetime(global_curve_preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+                st.subheader("Latest global nominal curve points")
+                st.dataframe(prepare_dataframe_for_display(global_curve_preview), width="stretch", hide_index=True)
 
         with tabs[6]:
             mapping_tabs = st.tabs(["Validated mapping", "Raw mapping", "Live prices"])
