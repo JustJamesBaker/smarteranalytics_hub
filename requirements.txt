@@ -3,3 +3,7 @@ pandas
 numpy
 yfinance
 openpyxl
+matplotlib
+python-pptx
+lxml
+XlsxWriter
