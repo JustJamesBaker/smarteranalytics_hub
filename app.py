@@ -1,6 +1,7 @@
 from pathlib import Path
 import base64
 import json
+import contextlib
 from io import BytesIO, StringIO
 from html.parser import HTMLParser
 import re
@@ -34,6 +35,8 @@ POWERED_BY_FILE = BASE_DIR / "Powered by SA.png"
 
 TIME_SERIES_SHEET = "time_series"
 MAPPING_SHEET = "mapping"
+REGIONS_SHEET = "regions"
+SECTORS_SHEET = "sectors"
 
 BRAND_ORANGE = "#f36f21"
 BRAND_ORANGE_DARK = "#d65f17"
@@ -48,7 +51,8 @@ PAGE_LABELS = {
     "Charts": "Performance analysis",
     "Risk": "Risk analysis",
     "Geo": "Geographic analysis",
-    "Yield": "Yield curves",
+    "Sector": "Sector analysis",
+    "Yield": "Rates & FX",
 }
 DISPLAY_NAME_OVERRIDES = {
     "Global stocks": "Global market",
@@ -320,7 +324,24 @@ WORLD_GOVERNMENT_BONDS_COUNTRIES = [
     ("Spain", "/country/spain/"),
     ("Netherlands", "/country/netherlands/"),
 ]
-FX_DOWNLOAD_START = "2000-01-01"
+FX_DOWNLOAD_START = "1996-01-01"
+GEO_MAX_START = pd.Timestamp("1996-03-18")
+GEO_NEUTRAL_CURRENCIES = ["USD", "GBP", "AUD", "EUR", "NOK"]
+MSCI_ACWI_IMI_REGION_WEIGHTS = {
+    "North America": 65.9,
+    "Pacific": 8.0,
+    "Europe": 14.9,
+    "Emerging": 11.3,
+}
+PATCHWORK_COUNTRY_SETS = {
+    "All countries": None,
+    "Largest 20": "largest_20",
+    "Largest 10": "largest_10",
+    "Regional": ["North America", "Pacific", "Europe", "Emerging"],
+}
+COMPANIESMARKETCAP_COUNTRIES_URL = "https://companiesmarketcap.com/gbp/all-countries/"
+MSCI_ACWI_IMI_REGION_SOURCE_URL = "https://www.msci.com/research-and-insights/video/acwi-imi-complete-geographic-breakdown"
+MSCI_ACWI_IMI_REGION_SOURCE_DATE = pd.Timestamp("2025-12-31")
 FX_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "SEK", "NOK"]
 FX_TICKER_SPECS = {
     "EUR": ("EURUSD=X", "direct"),
@@ -339,6 +360,8 @@ FX_PERIODS = {
     "3Y": "3Y",
     "5Y": "5Y",
     "10Y": "10Y",
+    "20Y": "20Y",
+    "MAX": "MAX",
 }
 
 DEFAULT_ASSET_ORDER = [
@@ -515,9 +538,80 @@ def get_period_start_anchor(end_date: pd.Timestamp, period_key: str) -> pd.Times
     end_date = pd.Timestamp(end_date)
     if period_key == "YTD":
         return pd.Timestamp(end_date.year - 1, 12, 31)
-    years_map = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10}
+    if period_key == "MAX":
+        return GEO_MAX_START
+    years_map = {"1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10, "20Y": 20}
     years = years_map.get(period_key)
     return end_date - pd.DateOffset(years=years) if years is not None else end_date
+
+
+def get_fx_max_start_anchor(fx_values_df: pd.DataFrame) -> pd.Timestamp:
+    if fx_values_df.empty:
+        return pd.Timestamp("2000-01-01")
+
+    start_dates = []
+    for currency in FX_CURRENCIES:
+        series = fx_values_df.get(currency, pd.Series(dtype=float)).dropna().sort_index()
+        if series.empty:
+            continue
+        start_dates.append(pd.Timestamp(series.index.min()).normalize())
+
+    if not start_dates:
+        return pd.Timestamp("2000-01-01")
+
+    return max(start_dates)
+
+
+def get_fx_period_start_anchor(end_date: pd.Timestamp, period_key: str, fx_values_df: pd.DataFrame) -> pd.Timestamp:
+    if period_key == "MAX":
+        return get_fx_max_start_anchor(fx_values_df)
+    return get_period_start_anchor(end_date, period_key)
+
+
+def get_fx_period_options(end_date: pd.Timestamp | None, fx_values_df: pd.DataFrame) -> list[str]:
+    if end_date is None:
+        return ["YTD", "1Y", "3Y", "5Y", "10Y", "MAX"]
+
+    options = ["YTD", "1Y", "3Y", "5Y", "10Y"]
+    max_anchor = get_fx_max_start_anchor(fx_values_df)
+    if max_anchor <= pd.Timestamp(end_date) - pd.DateOffset(years=20):
+        options.append("20Y")
+    options.append("MAX")
+    return options
+
+
+def get_geo_max_start_anchor(fx_values_df: pd.DataFrame, neutral_currency: str) -> pd.Timestamp:
+    anchor = GEO_MAX_START
+    if neutral_currency == "USD":
+        return anchor
+
+    neutral_series = fx_values_df.get(neutral_currency, pd.Series(dtype=float)).dropna().sort_index()
+    if neutral_series.empty:
+        return anchor
+    return max(anchor, pd.Timestamp(neutral_series.index.min()).normalize())
+
+
+def get_geo_period_start_anchor(
+    end_date: pd.Timestamp,
+    period_key: str,
+    fx_values_df: pd.DataFrame,
+    neutral_currency: str,
+) -> pd.Timestamp:
+    if period_key == "MAX":
+        return get_geo_max_start_anchor(fx_values_df, neutral_currency)
+    return get_period_start_anchor(end_date, period_key)
+
+
+def get_geo_period_options(end_date: pd.Timestamp | None, fx_values_df: pd.DataFrame, neutral_currency: str) -> list[str]:
+    if end_date is None:
+        return list(FX_PERIODS.keys())
+
+    options = ["YTD", "1Y", "3Y", "5Y", "10Y"]
+    max_anchor = get_geo_max_start_anchor(fx_values_df, neutral_currency)
+    if max_anchor <= pd.Timestamp(end_date) - pd.DateOffset(years=20):
+        options.append("20Y")
+    options.append("MAX")
+    return options
 
 
 @st.cache_data(show_spinner=False, ttl=43200)
@@ -562,7 +656,7 @@ def build_currency_performance_matrix(fx_values_df: pd.DataFrame, period_key: st
         return pd.DataFrame(), None
 
     end_date = min(last_dates)
-    start_anchor = get_period_start_anchor(end_date, period_key)
+    start_anchor = get_fx_period_start_anchor(end_date, period_key, fx_values_df)
     rows = []
 
     for row_currency in FX_CURRENCIES:
@@ -581,10 +675,816 @@ def build_currency_performance_matrix(fx_values_df: pd.DataFrame, period_key: st
                 row[col_currency] = np.nan
                 continue
             cross_series = (cross_df["row"] / cross_df["col"]).dropna()
-            row[col_currency] = calc_period_return(cross_series, end_date, period_key, whole_period_start=start_anchor)
+            if period_key == "MAX":
+                row[col_currency] = calc_period_return(cross_series, end_date, "Period", whole_period_start=start_anchor)
+            else:
+                row[col_currency] = calc_period_return(cross_series, end_date, period_key, whole_period_start=start_anchor)
         rows.append(row)
 
     return pd.DataFrame(rows), end_date
+
+
+def build_country_performance_df(
+    regions_df: pd.DataFrame,
+    fx_values_df: pd.DataFrame,
+    period_key: str,
+    neutral_currency: str = "GBP",
+    preferred_series_map: dict[str, pd.Series] | None = None,
+) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    if regions_df.empty:
+        return pd.DataFrame(), None
+
+    countries = regions_df[
+        (regions_df["country_flag"] == 1) & regions_df["available"].fillna(False)
+    ].copy()
+    if countries.empty:
+        return pd.DataFrame(), None
+
+    tickers = tuple(sorted({normalise_ticker(t) for t in countries["ticker"].tolist() if normalise_ticker(t)}))
+    # Geographic country analysis needs pre-2000 ETF history for the MAX view.
+    prices_df = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if prices_df.empty:
+        return pd.DataFrame(), None
+
+    quote_currency_map = fetch_yf_quote_currencies(tickers)
+
+    last_dates = [
+        pd.Timestamp(prices_df[c].dropna().index.max())
+        for c in prices_df.columns
+        if not prices_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return pd.DataFrame(), None
+
+    end_date = min(last_dates)
+    neutral_series = (
+        fx_values_df.get(neutral_currency, pd.Series(dtype=float)).dropna().sort_index()
+        if neutral_currency
+        else pd.Series(dtype=float)
+    )
+    start_anchor = get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    rows = []
+
+    for row in countries.itertuples():
+        ticker = normalise_ticker(row.ticker)
+        series = get_price_series(prices_df, ticker)
+        if series.empty:
+            continue
+        series = series[series.index <= end_date]
+        if series.empty:
+            continue
+
+        quote_currency = quote_currency_map.get(ticker, "")
+        converted_series = series.copy()
+        if neutral_currency == "USD":
+            converted_series = series.copy()
+            quote_currency = quote_currency or "USD"
+        elif neutral_currency and quote_currency and quote_currency != neutral_currency:
+            quote_fx_series = fx_values_df.get(quote_currency, pd.Series(dtype=float)).dropna().sort_index()
+            if quote_fx_series.empty or neutral_series.empty:
+                continue
+            aligned = pd.concat(
+                [
+                    series.rename("price"),
+                    quote_fx_series.rename("quote_fx"),
+                    neutral_series.rename("neutral_fx"),
+                ],
+                axis=1,
+            ).sort_index().ffill().dropna()
+            if aligned.empty:
+                continue
+            converted_series = (aligned["price"] * aligned["quote_fx"] / aligned["neutral_fx"]).dropna()
+        elif neutral_currency and quote_currency == neutral_currency:
+            converted_series = series.copy()
+        elif neutral_currency and not quote_currency:
+            continue
+
+        if period_key == "MAX":
+            performance = calc_period_return(
+                converted_series,
+                end_date,
+                "Period",
+                whole_period_start=start_anchor,
+            )
+        else:
+            performance = calc_period_return(
+                converted_series,
+                end_date,
+                period_key,
+                whole_period_start=start_anchor,
+            )
+        if pd.isna(performance):
+            continue
+
+        rows.append(
+            {
+                "ticker": ticker,
+                "country": row.investment_area,
+                "name": row.name,
+                "quote_currency": quote_currency or "-",
+                "neutral_currency": neutral_currency or "-",
+                "performance": performance,
+            }
+        )
+
+    if not rows:
+        out = pd.DataFrame(columns=["ticker", "country", "name", "quote_currency", "neutral_currency", "performance"])
+    else:
+        out = pd.DataFrame(rows)
+
+    if preferred_series_map is not None and "Global stocks" in preferred_series_map:
+        global_series = preferred_series_map.get("Global stocks", pd.Series(dtype=float)).dropna().sort_index()
+        global_series = global_series[global_series.index <= end_date]
+        if not global_series.empty:
+            if period_key == "MAX":
+                global_return = calc_period_return(global_series, end_date, "Period", whole_period_start=start_anchor)
+            else:
+                global_return = calc_period_return(global_series, end_date, period_key, whole_period_start=start_anchor)
+            if pd.notna(global_return):
+                global_df = pd.DataFrame(
+                    [
+                        {
+                            "ticker": "Global market",
+                            "country": "Global market",
+                            "name": "Global market",
+                            "quote_currency": neutral_currency,
+                            "neutral_currency": neutral_currency,
+                            "performance": global_return,
+                        }
+                    ]
+                )
+                if out.empty or out.dropna(how="all").empty:
+                    out = global_df
+                else:
+                    out = pd.concat([global_df, out], ignore_index=True)
+
+    if out.empty:
+        return pd.DataFrame(), end_date
+
+    out = out.sort_values(["performance", "country"], ascending=[False, True]).reset_index(drop=True)
+    return out, end_date
+
+
+def build_country_series_map(
+    regions_df: pd.DataFrame,
+    fx_values_df: pd.DataFrame,
+    neutral_currency: str = "USD",
+    preferred_series_map: dict[str, pd.Series] | None = None,
+) -> tuple[dict[str, pd.Series], pd.Timestamp | None]:
+    if regions_df.empty:
+        return {}, None
+
+    countries = regions_df[
+        (regions_df["country_flag"] == 1) & regions_df["available"].fillna(False)
+    ].copy()
+    if countries.empty:
+        return {}, None
+
+    tickers = tuple(sorted({normalise_ticker(t) for t in countries["ticker"].tolist() if normalise_ticker(t)}))
+    prices_df = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if prices_df.empty:
+        return {}, None
+
+    quote_currency_map = fetch_yf_quote_currencies(tickers)
+    last_dates = [
+        pd.Timestamp(prices_df[c].dropna().index.max())
+        for c in prices_df.columns
+        if not prices_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return {}, None
+
+    end_date = min(last_dates)
+    out: dict[str, pd.Series] = {}
+
+    for row in countries.itertuples():
+        ticker = normalise_ticker(row.ticker)
+        series = get_price_series(prices_df, ticker)
+        if series.empty:
+            continue
+        series = series[series.index <= end_date]
+        if series.empty:
+            continue
+
+        quote_currency = quote_currency_map.get(ticker, "") or ("USD" if neutral_currency == "USD" else "")
+        converted_series = (
+            series.copy()
+            if neutral_currency == "USD"
+            else convert_price_series_to_neutral_currency(series, quote_currency, neutral_currency, fx_values_df)
+        )
+        if converted_series.empty:
+            continue
+        out[str(row.investment_area).strip()] = converted_series.dropna().sort_index()
+
+    if preferred_series_map is not None and "Global stocks" in preferred_series_map:
+        global_series = preferred_series_map.get("Global stocks", pd.Series(dtype=float)).dropna().sort_index()
+        global_series = global_series[global_series.index <= end_date]
+        if not global_series.empty:
+            out["Global market"] = global_series
+
+    return out, end_date
+
+
+def build_labelled_series_map(
+    source_df: pd.DataFrame,
+    label_col: str,
+    fx_values_df: pd.DataFrame,
+    neutral_currency: str = "USD",
+    preferred_series_map: dict[str, pd.Series] | None = None,
+) -> tuple[dict[str, pd.Series], pd.Timestamp | None]:
+    if source_df.empty:
+        return {}, None
+
+    working = source_df[source_df["available"].fillna(False)].copy()
+    if working.empty:
+        return {}, None
+
+    tickers = tuple(sorted({normalise_ticker(t) for t in working["ticker"].tolist() if normalise_ticker(t)}))
+    prices_df = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if prices_df.empty:
+        return {}, None
+
+    quote_currency_map = fetch_yf_quote_currencies(tickers)
+    last_dates = [
+        pd.Timestamp(prices_df[c].dropna().index.max())
+        for c in prices_df.columns
+        if not prices_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return {}, None
+
+    end_date = min(last_dates)
+    out: dict[str, pd.Series] = {}
+
+    for row in working.itertuples():
+        ticker = normalise_ticker(row.ticker)
+        series = get_price_series(prices_df, ticker)
+        if series.empty:
+            continue
+        series = series[series.index <= end_date]
+        if series.empty:
+            continue
+
+        quote_currency = quote_currency_map.get(ticker, "") or ("USD" if neutral_currency == "USD" else "")
+        converted_series = (
+            series.copy()
+            if neutral_currency == "USD"
+            else convert_price_series_to_neutral_currency(series, quote_currency, neutral_currency, fx_values_df)
+        )
+        if converted_series.empty:
+            continue
+        out[str(getattr(row, label_col)).strip()] = converted_series.dropna().sort_index()
+
+    if preferred_series_map is not None and "Global stocks" in preferred_series_map:
+        global_series = preferred_series_map.get("Global stocks", pd.Series(dtype=float)).dropna().sort_index()
+        global_series = global_series[global_series.index <= end_date]
+        if not global_series.empty:
+            out["Global market"] = global_series
+
+    return out, end_date
+
+
+def build_labelled_performance_df(
+    source_df: pd.DataFrame,
+    label_col: str,
+    fx_values_df: pd.DataFrame,
+    period_key: str,
+    neutral_currency: str = "USD",
+    preferred_series_map: dict[str, pd.Series] | None = None,
+) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    series_map, end_date = build_labelled_series_map(
+        source_df,
+        label_col,
+        fx_values_df,
+        neutral_currency,
+        preferred_series_map=preferred_series_map,
+    )
+    if not series_map or end_date is None:
+        return pd.DataFrame(), None
+
+    start_anchor = get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    rows = []
+    for label, series in series_map.items():
+        performance = calc_period_return(
+            series,
+            end_date,
+            "Period" if period_key == "MAX" else period_key,
+            whole_period_start=start_anchor,
+        )
+        if pd.isna(performance):
+            continue
+        rows.append({"label": label, "ticker": "", "performance": performance})
+
+    if not rows:
+        return pd.DataFrame(), end_date
+
+    out = pd.DataFrame(rows).sort_values(["performance", "label"], ascending=[False, True]).reset_index(drop=True)
+    return out, end_date
+
+
+def canonical_region_name(name: object) -> str:
+    raw = str(name).strip()
+    normalized = re.sub(r"[^a-z]+", "", raw.lower())
+    aliases = {
+        "northamerica": "North America",
+        "americas": "North America",
+        "pacific": "Pacific",
+        "asiapacific": "Pacific",
+        "apac": "Pacific",
+        "europe": "Europe",
+        "emea": "Europe",
+        "europemiddleeastandafrica": "Europe",
+        "emerging": "Emerging",
+        "emergingmarkets": "Emerging",
+        "em": "Emerging",
+    }
+    return aliases.get(normalized, raw)
+
+
+def infer_canonical_region(row: pd.Series | object) -> str:
+    def _get(attr: str) -> str:
+        if isinstance(row, pd.Series):
+            return str(row.get(attr, "")).strip()
+        return str(getattr(row, attr, "")).strip()
+
+    candidates = [
+        _get("investment_area"),
+        _get("name"),
+        _get("ticker"),
+    ]
+
+    explicit_ticker_map = {
+        "VGK": "Europe",
+        "VPL": "Pacific",
+        "VWO": "Emerging",
+        "INAA": "North America",
+        "IE0030404903": "North America",
+    }
+    ticker = normalise_ticker(_get("ticker"))
+    if ticker in explicit_ticker_map:
+        return explicit_ticker_map[ticker]
+
+    for candidate in candidates:
+        mapped = canonical_region_name(candidate)
+        if mapped in MSCI_ACWI_IMI_REGION_WEIGHTS:
+            return mapped
+
+    combined = " ".join(candidates).strip()
+    mapped = canonical_region_name(combined)
+    return mapped
+
+
+def convert_price_series_to_neutral_currency(
+    series: pd.Series,
+    quote_currency: str,
+    neutral_currency: str,
+    fx_values_df: pd.DataFrame,
+) -> pd.Series:
+    series = series.dropna().sort_index()
+    if series.empty:
+        return pd.Series(dtype=float)
+
+    if neutral_currency == "USD":
+        return series.copy()
+
+    if neutral_currency and quote_currency and quote_currency != neutral_currency:
+        quote_fx_series = fx_values_df.get(quote_currency, pd.Series(dtype=float)).dropna().sort_index()
+        neutral_series = fx_values_df.get(neutral_currency, pd.Series(dtype=float)).dropna().sort_index()
+        if quote_fx_series.empty or neutral_series.empty:
+            return pd.Series(dtype=float)
+        aligned = pd.concat(
+            [
+                series.rename("price"),
+                quote_fx_series.rename("quote_fx"),
+                neutral_series.rename("neutral_fx"),
+            ],
+            axis=1,
+        ).sort_index().ffill().dropna()
+        if aligned.empty:
+            return pd.Series(dtype=float)
+        return (aligned["price"] * aligned["quote_fx"] / aligned["neutral_fx"]).dropna()
+
+    if neutral_currency and quote_currency == neutral_currency:
+        return series.copy()
+
+    if neutral_currency and not quote_currency:
+        return pd.Series(dtype=float)
+
+    return series.copy()
+
+
+def build_region_performance_df(
+    regions_df: pd.DataFrame,
+    fx_values_df: pd.DataFrame,
+    period_key: str,
+    neutral_currency: str = "USD",
+    preferred_series_map: dict[str, pd.Series] | None = None,
+) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    if regions_df.empty:
+        return pd.DataFrame(), None
+
+    regions = regions_df[
+        (regions_df["region_flag"] == 1) & regions_df["available"].fillna(False)
+    ].copy()
+    if regions.empty:
+        return pd.DataFrame(), None
+
+    regions["canonical_region"] = regions.apply(infer_canonical_region, axis=1)
+    regions = regions[regions["canonical_region"].isin(MSCI_ACWI_IMI_REGION_WEIGHTS.keys())].copy()
+    if regions.empty:
+        return pd.DataFrame(), None
+
+    tickers = tuple(sorted({normalise_ticker(t) for t in regions["ticker"].tolist() if normalise_ticker(t)}))
+    prices_df = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if prices_df.empty:
+        return pd.DataFrame(), None
+
+    quote_currency_map = fetch_yf_quote_currencies(tickers)
+    last_dates = [
+        pd.Timestamp(prices_df[c].dropna().index.max())
+        for c in prices_df.columns
+        if not prices_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return pd.DataFrame(), None
+
+    end_date = min(last_dates)
+    start_anchor = get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    rows = []
+
+    for row in regions.drop_duplicates(subset=["canonical_region"], keep="first").itertuples():
+        ticker = normalise_ticker(row.ticker)
+        series = get_price_series(prices_df, ticker)
+        if series.empty:
+            continue
+        series = series[series.index <= end_date]
+        if series.empty:
+            continue
+
+        quote_currency = quote_currency_map.get(ticker, "") or "USD"
+        converted_series = convert_price_series_to_neutral_currency(series, quote_currency, neutral_currency, fx_values_df)
+        if converted_series.empty:
+            continue
+
+        performance = calc_period_return(
+            converted_series,
+            end_date,
+            "Period" if period_key == "MAX" else period_key,
+            whole_period_start=start_anchor,
+        )
+        if pd.isna(performance):
+            continue
+
+        rows.append(
+            {
+                "region": row.canonical_region,
+                "ticker": ticker,
+                "performance": performance,
+                "weight": float(MSCI_ACWI_IMI_REGION_WEIGHTS.get(row.canonical_region, np.nan)),
+            }
+        )
+
+    out = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["region", "ticker", "performance", "weight"])
+
+    if preferred_series_map is not None and "Global stocks" in preferred_series_map:
+        global_series = preferred_series_map.get("Global stocks", pd.Series(dtype=float)).dropna().sort_index()
+        global_series = global_series[global_series.index <= end_date]
+        if not global_series.empty:
+            global_return = calc_period_return(
+                global_series,
+                end_date,
+                "Period" if period_key == "MAX" else period_key,
+                whole_period_start=start_anchor,
+            )
+            if pd.notna(global_return):
+                global_df = pd.DataFrame(
+                    [{"region": "Global market", "ticker": "Global market", "performance": global_return, "weight": 100.0}]
+                )
+                if out.empty or out.dropna(how="all").empty:
+                    out = global_df
+                else:
+                    out = pd.concat([global_df, out], ignore_index=True)
+
+    if out.empty:
+        return pd.DataFrame(), end_date
+
+    region_order = ["Global market"] + list(MSCI_ACWI_IMI_REGION_WEIGHTS.keys())
+    out["region_order"] = out["region"].map({name: idx for idx, name in enumerate(region_order)}).fillna(999)
+    out = out.sort_values(["region_order", "region"]).drop(columns="region_order").reset_index(drop=True)
+    return out, end_date
+
+
+def build_region_series_map(
+    regions_df: pd.DataFrame,
+    fx_values_df: pd.DataFrame,
+    neutral_currency: str = "USD",
+) -> tuple[dict[str, pd.Series], pd.Timestamp | None]:
+    if regions_df.empty:
+        return {}, None
+
+    regions = regions_df[
+        (regions_df["region_flag"] == 1) & regions_df["available"].fillna(False)
+    ].copy()
+    if regions.empty:
+        return {}, None
+
+    regions["canonical_region"] = regions.apply(infer_canonical_region, axis=1)
+    regions = regions[regions["canonical_region"].isin(MSCI_ACWI_IMI_REGION_WEIGHTS.keys())].copy()
+    if regions.empty:
+        return {}, None
+
+    tickers = tuple(sorted({normalise_ticker(t) for t in regions["ticker"].tolist() if normalise_ticker(t)}))
+    prices_df = fetch_yf_prices(tickers, FX_DOWNLOAD_START)
+    if prices_df.empty:
+        return {}, None
+
+    quote_currency_map = fetch_yf_quote_currencies(tickers)
+    last_dates = [
+        pd.Timestamp(prices_df[c].dropna().index.max())
+        for c in prices_df.columns
+        if not prices_df[c].dropna().empty
+    ]
+    if not last_dates:
+        return {}, None
+
+    end_date = min(last_dates)
+    out: dict[str, pd.Series] = {}
+
+    for row in regions.drop_duplicates(subset=["canonical_region"], keep="first").itertuples():
+        ticker = normalise_ticker(row.ticker)
+        series = get_price_series(prices_df, ticker)
+        if series.empty:
+            continue
+        series = series[series.index <= end_date]
+        if series.empty:
+            continue
+
+        quote_currency = quote_currency_map.get(ticker, "") or ("USD" if neutral_currency == "USD" else "")
+        converted_series = (
+            series.copy()
+            if neutral_currency == "USD"
+            else convert_price_series_to_neutral_currency(series, quote_currency, neutral_currency, fx_values_df)
+        )
+        if converted_series.empty:
+            continue
+        out[str(row.canonical_region).strip()] = converted_series.dropna().sort_index()
+
+    return out, end_date
+
+
+def build_country_tiles_html(country_df: pd.DataFrame) -> str:
+    if country_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No country data available.</div></div>'
+
+    vmin = float(country_df["performance"].min()) if not country_df.empty else -0.1
+    vmax = float(country_df["performance"].max()) if not country_df.empty else 0.1
+    cards = []
+    for row in country_df.itertuples():
+        colour = "#3b3b3b" if str(row.country) == "Global market" else heat_colour(float(row.performance), vmin, vmax)
+        cards.append(
+            (
+                f'<div class="country-card" style="background:{colour};">'
+                f'<div class="country-card-title">{row.country}</div>'
+                f'<div class="country-card-meta">{row.ticker}</div>'
+                f'<div class="country-card-value">{format_pct(float(row.performance))}</div>'
+                f'</div>'
+            )
+        )
+
+    return f'<div class="country-card-grid">{"".join(cards)}</div>'
+
+
+def build_label_tiles_html(label_df: pd.DataFrame) -> str:
+    if label_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No data available.</div></div>'
+
+    vmin = float(label_df["performance"].min()) if not label_df.empty else -0.1
+    vmax = float(label_df["performance"].max()) if not label_df.empty else 0.1
+    cards = []
+    for row in label_df.itertuples():
+        colour = "#3b3b3b" if str(row.label) == "Global market" else heat_colour(float(row.performance), vmin, vmax)
+        cards.append(
+            (
+                f'<div class="country-card" style="background:{colour};">'
+                f'<div class="country-card-title">{row.label}</div>'
+                f'<div class="country-card-value">{format_pct(float(row.performance))}</div>'
+                f'</div>'
+            )
+        )
+
+    return f'<div class="country-card-grid">{"".join(cards)}</div>'
+
+
+def build_region_tiles_html(region_df: pd.DataFrame) -> str:
+    if region_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No regional data available.</div></div>'
+
+    vmin = float(region_df["performance"].min()) if not region_df.empty else -0.1
+    vmax = float(region_df["performance"].max()) if not region_df.empty else 0.1
+
+    global_row = region_df[region_df["region"] == "Global market"]
+    regional_rows = region_df[region_df["region"] != "Global market"].copy()
+    regional_rows = regional_rows[regional_rows["weight"].notna()].copy()
+    total_weight = float(regional_rows["weight"].sum()) if not regional_rows.empty else 0.0
+
+    global_html = ""
+    if not global_row.empty:
+        row = global_row.iloc[0]
+        global_html = (
+            f'<div class="region-global-card" style="background:#3b3b3b;">'
+            f'<div class="region-card-title">{row["region"]}</div>'
+            f'<div class="region-card-meta">{row["ticker"]}</div>'
+            f'<div class="region-card-value">{format_pct(float(row["performance"]))}</div>'
+            f'</div>'
+        )
+
+    region_cards = []
+    for _, row in regional_rows.iterrows():
+        width_pct = (float(row["weight"]) / total_weight * 100.0) if total_weight > 0 else 25.0
+        region_cards.append(
+            f'<div class="region-card" style="flex:{width_pct:.4f} 1 0;background:{heat_colour(float(row["performance"]), vmin, vmax)};">'
+            f'<div class="region-card-title">{row["region"]}</div>'
+            f'<div class="region-card-meta">{row["ticker"]} · {row["weight"]:.1f}%</div>'
+            f'<div class="region-card-value">{format_pct(float(row["performance"]))}</div>'
+            f'</div>'
+        )
+
+    return (
+        '<div class="region-card-shell">'
+        f"{global_html}"
+        f'<div class="region-card-row">{"".join(region_cards)}</div>'
+        "</div>"
+    )
+
+
+def build_distinct_colour_map(labels: list[str]) -> dict[str, str]:
+    labels = [str(label) for label in labels]
+    palette = [
+        "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+        "#17becf", "#e377c2", "#8c564b", "#bcbd22", "#7f7f7f",
+        "#3366cc", "#dc3912", "#109618", "#990099", "#0099c6",
+        "#dd4477", "#66aa00", "#b82e2e", "#316395", "#994499",
+        "#22aa99", "#aaaa11", "#6633cc", "#e67300", "#8b0707",
+        "#651067", "#329262", "#5574a6", "#3b3eac", "#b77322",
+    ]
+    out: dict[str, str] = {}
+    for idx, label in enumerate(sorted(labels)):
+        out[label] = palette[idx % len(palette)]
+    if "Global market" in labels:
+        out["Global market"] = "#3b3b3b"
+    return out
+
+
+def build_country_patchwork_quilt(
+    country_series_map: dict[str, pd.Series],
+    end_date: pd.Timestamp | None,
+    years_back: int = 10,
+    include_labels: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
+    if not country_series_map or end_date is None:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    if include_labels is not None:
+        allowed = {str(label) for label in include_labels}
+        country_series_map = {label: series for label, series in country_series_map.items() if str(label) in allowed}
+        if not country_series_map:
+            return pd.DataFrame(), pd.DataFrame(), []
+
+    end_ts = pd.Timestamp(end_date)
+    last_complete_year = end_ts.year if (end_ts.month == 12 and end_ts.day == 31) else end_ts.year - 1
+    years = list(range(last_complete_year - years_back + 1, last_complete_year + 1))
+    if not years:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    returns_by_country: dict[str, dict[int, float]] = {}
+    period_summary_rows: list[dict[str, object]] = []
+    quilt_start = pd.Timestamp(years[0] - 1, 12, 31)
+    quilt_end = pd.Timestamp(years[-1], 12, 31)
+
+    for country, series in country_series_map.items():
+        s = series.dropna().sort_index()
+        if s.empty:
+            continue
+
+        yearly_returns: dict[int, float] = {}
+        valid_all_years = True
+        for year in years:
+            _, base_level = nearest_level_on_or_before(s, pd.Timestamp(year - 1, 12, 31))
+            _, end_level = nearest_level_on_or_before(s, pd.Timestamp(year, 12, 31))
+            if base_level is None or end_level is None or base_level <= 0:
+                valid_all_years = False
+                break
+            yearly_returns[year] = (float(end_level) / float(base_level)) - 1
+
+        if not valid_all_years:
+            continue
+
+        period_return = calc_period_return(s, quilt_end, "Period", whole_period_start=quilt_start)
+        returns_by_country[country] = yearly_returns
+        period_summary_rows.append({"country": country, "period_return": period_return})
+
+    if not returns_by_country:
+        return pd.DataFrame(), pd.DataFrame(), years
+
+    quilt_rows: list[dict[str, object]] = []
+    max_rank = len(returns_by_country)
+    for year in years:
+        ranked = sorted(
+            (
+                {"country": country, "return_value": country_returns[year]}
+                for country, country_returns in returns_by_country.items()
+            ),
+            key=lambda item: (item["return_value"], item["country"]),
+            reverse=True,
+        )
+        for rank, item in enumerate(ranked, start=1):
+            quilt_rows.append(
+                {
+                    "year": year,
+                    "rank": rank,
+                    "country": item["country"],
+                    "return_value": item["return_value"],
+                    "max_rank": max_rank,
+                }
+            )
+
+    quilt_df = pd.DataFrame(quilt_rows)
+    legend_df = pd.DataFrame(period_summary_rows).sort_values(["period_return", "country"], ascending=[False, True]).reset_index(drop=True)
+    return quilt_df, legend_df, years
+
+
+def resolve_patchwork_labels(
+    patchwork_view: str,
+    available_labels: list[str],
+    country_rankings_df: pd.DataFrame,
+) -> list[str] | None:
+    selector = PATCHWORK_COUNTRY_SETS.get(patchwork_view)
+    if selector is None:
+        return selector
+    if isinstance(selector, list):
+        labels = list(selector)
+        if "Global market" in available_labels and "Global market" not in labels:
+            labels = ["Global market"] + labels
+        return labels
+
+    if country_rankings_df.empty:
+        return None
+
+    limit = 20 if selector == "largest_20" else 10 if selector == "largest_10" else None
+    if limit is None:
+        return None
+
+    available_set = {str(label) for label in available_labels}
+    ranked = country_rankings_df[country_rankings_df["country"].isin(available_set)]["country"].astype(str).tolist()
+    labels = ranked[:limit]
+    if "Global market" in available_labels and "Global market" not in labels:
+        labels = ["Global market"] + labels
+    return labels
+
+
+def build_country_patchwork_html(quilt_df: pd.DataFrame, legend_df: pd.DataFrame, years: list[int]) -> str:
+    if quilt_df.empty or legend_df.empty or not years:
+        return '<div class="table-shell"><div class="table-empty">No patchwork-quilt data available.</div></div>'
+
+    countries = legend_df["country"].astype(str).tolist()
+    colour_map = build_distinct_colour_map(countries)
+    max_rank = int(quilt_df["max_rank"].max())
+
+    header_html = "".join(f'<div class="patchwork-year-header">{year}</div>' for year in years)
+    body_cols = []
+    for year in years:
+        year_rows = quilt_df[quilt_df["year"] == year].sort_values("rank")
+        cell_html = []
+        for _, row in year_rows.iterrows():
+            country = str(row["country"])
+            cell_html.append(
+                f'<div class="patchwork-cell" style="background:{colour_map[country]};">'
+                f'<div class="patchwork-cell-country">{country}</div>'
+                f'<div class="patchwork-cell-return">{format_pct(float(row["return_value"]))}</div>'
+                f'</div>'
+            )
+        body_cols.append(f'<div class="patchwork-year-col">{"".join(cell_html)}</div>')
+
+    legend_items = []
+    for _, row in legend_df.iterrows():
+        country = str(row["country"])
+        legend_items.append(
+            f'<div class="patchwork-legend-item">'
+            f'<span class="patchwork-legend-swatch" style="background:{colour_map[country]};"></span>'
+            f'<span class="patchwork-legend-country">{country}</span>'
+            f'<span class="patchwork-legend-return">{format_pct(float(row["period_return"]))}</span>'
+            f'</div>'
+        )
+
+    return (
+        '<div class="patchwork-shell">'
+        f'<div class="patchwork-grid" style="grid-template-columns: repeat({len(years)}, minmax(92px, 1fr));">'
+        f"{header_html}{''.join(body_cols)}"
+        '</div>'
+        '<div class="patchwork-legend-title">Legend and displayed-period return</div>'
+        f'<div class="patchwork-legend">{"".join(legend_items)}</div>'
+        "</div>"
+    )
 
 
 def build_currency_matrix_html(matrix_df: pd.DataFrame) -> str:
@@ -1172,6 +2072,45 @@ def fetch_worldgovernmentbonds_html(page_url: str) -> str:
     response = requests.get(page_url, headers=headers, timeout=45)
     response.raise_for_status()
     return response.text
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def fetch_companiesmarketcap_country_rankings(page_url: str) -> pd.DataFrame:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(page_url, headers=headers, timeout=45)
+    response.raise_for_status()
+
+    tables = pd.read_html(StringIO(response.text))
+    if not tables:
+        return pd.DataFrame(columns=["rank", "country"])
+
+    table = tables[0].copy()
+    table.columns = [str(col).strip().lower() for col in table.columns]
+    rank_col = next((col for col in table.columns if "rank" in col), None)
+    country_col = next((col for col in table.columns if "name" in col), None)
+    if rank_col is None or country_col is None:
+        return pd.DataFrame(columns=["rank", "country"])
+
+    out = table[[rank_col, country_col]].copy()
+    out.columns = ["rank", "country"]
+    out["rank"] = pd.to_numeric(out["rank"], errors="coerce")
+    out["country"] = out["country"].astype(str).str.strip()
+    out = out.dropna(subset=["rank", "country"])
+
+    name_map = {
+        "United States": "USA",
+        "United Kingdom": "UK",
+        "South Korea": "Korea",
+        "United Arab Emirates": "UAE",
+    }
+    out["country"] = out["country"].replace(name_map)
+    return out.sort_values("rank").reset_index(drop=True)
 
 
 def fetch_worldgovernmentbonds_country_payload(page_url: str, global_vars: dict) -> dict:
@@ -2117,6 +3056,119 @@ def load_data(file_path: str, file_mtime: float) -> tuple[pd.DataFrame, pd.DataF
 
 
 @st.cache_data(show_spinner=False)
+def load_regions_data(file_path: str, file_mtime: float) -> pd.DataFrame:
+    try:
+        regions = pd.read_excel(file_path, sheet_name=REGIONS_SHEET)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "investment_area", "available", "country_flag", "region_flag"])
+
+    regions.columns = [str(c).strip() for c in regions.columns]
+    regions = regions.copy()
+
+    normalized_cols = {str(c).strip().lower(): str(c).strip() for c in regions.columns}
+    rename_map = {}
+    explicit_name_map = {
+        "ticker": "ticker",
+        "name": "name",
+        "investment_area": "investment_area",
+        "available": "available",
+        "country": "country_flag",
+        "region": "region_flag",
+    }
+    for source_name, target_name in explicit_name_map.items():
+        if source_name in normalized_cols:
+            rename_map[normalized_cols[source_name]] = target_name
+    regions = regions.rename(columns=rename_map)
+
+    if "ticker" not in regions.columns:
+        return pd.DataFrame(columns=["ticker", "name", "investment_area", "available", "country_flag", "region_flag"])
+
+    regions["ticker"] = regions["ticker"].map(normalise_ticker)
+    if "name" in regions.columns:
+        regions["name"] = regions["name"].astype(str).str.strip()
+    else:
+        regions["name"] = regions["ticker"]
+    if "investment_area" in regions.columns:
+        regions["investment_area"] = regions["investment_area"].astype(str).str.strip()
+    else:
+        regions["investment_area"] = regions["name"]
+
+    if "available" in regions.columns:
+        regions["available"] = (
+            regions["available"].astype(str).str.strip().str.lower().isin({"yes", "y", "true", "1"})
+        )
+    else:
+        regions["available"] = True
+
+    regions["country_flag"] = pd.to_numeric(regions.get("country_flag", 0), errors="coerce").fillna(0).astype(int)
+    regions["region_flag"] = pd.to_numeric(regions.get("region_flag", 0), errors="coerce").fillna(0).astype(int)
+
+    regions = regions[regions["ticker"].astype(str).str.len() > 0].copy()
+    regions = regions.drop_duplicates(subset=["ticker"], keep="first")
+    return regions[["ticker", "name", "investment_area", "available", "country_flag", "region_flag"]]
+
+
+@st.cache_data(show_spinner=False)
+def load_sectors_data(file_path: str, file_mtime: float) -> pd.DataFrame:
+    try:
+        sectors = pd.read_excel(file_path, sheet_name=SECTORS_SHEET)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "sector", "available"])
+
+    sectors.columns = [str(c).strip() for c in sectors.columns]
+    sectors = sectors.copy()
+
+    normalized_cols = {str(c).strip().lower(): str(c).strip() for c in sectors.columns}
+    rename_map = {}
+    explicit_name_map = {
+        "ticker": "ticker",
+        "name": "name",
+        "sector": "sector",
+        "available": "available",
+    }
+    for source_name, target_name in explicit_name_map.items():
+        if source_name in normalized_cols:
+            rename_map[normalized_cols[source_name]] = target_name
+    sectors = sectors.rename(columns=rename_map)
+
+    if "ticker" not in sectors.columns:
+        return pd.DataFrame(columns=["ticker", "name", "sector", "available"])
+
+    sectors["ticker"] = sectors["ticker"].map(normalise_ticker)
+    sectors["name"] = sectors.get("name", sectors["ticker"]).astype(str).str.strip()
+    sectors["sector"] = sectors.get("sector", sectors["name"]).astype(str).str.strip()
+    if "available" in sectors.columns:
+        sectors["available"] = (
+            sectors["available"].astype(str).str.strip().str.lower().isin({"yes", "y", "true", "1"})
+        )
+    else:
+        sectors["available"] = True
+
+    sectors = sectors[sectors["ticker"].astype(str).str.len() > 0].copy()
+    sectors = sectors.drop_duplicates(subset=["ticker"], keep="first")
+    return sectors[["ticker", "name", "sector", "available"]]
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def fetch_yf_quote_currencies(tickers: tuple[str, ...]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for ticker in tickers:
+        norm_ticker = normalise_ticker(ticker)
+        if not norm_ticker:
+            continue
+        currency = ""
+        try:
+            with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+                fast = yf.Ticker(norm_ticker).fast_info
+            if fast:
+                currency = str(fast.get("currency", "") or "").upper().strip()
+        except Exception:
+            currency = ""
+        out[norm_ticker] = currency
+    return out
+
+
+@st.cache_data(show_spinner=False)
 def build_monthly_index_levels(ts: pd.DataFrame, mapping: pd.DataFrame) -> dict[str, pd.Series]:
     output = {}
     for _, row in mapping.iterrows():
@@ -2144,15 +3196,16 @@ def fetch_yf_prices(tickers: tuple[str, ...], start_date: str) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
 
-    data = yf.download(
-        list(tickers),
-        start=start_date,
-        progress=False,
-        auto_adjust=True,
-        actions=False,
-        threads=False,
-        group_by="ticker",
-    )
+    with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+        data = yf.download(
+            list(tickers),
+            start=start_date,
+            progress=False,
+            auto_adjust=True,
+            actions=False,
+            threads=False,
+            group_by="ticker",
+        )
 
     if data is None or len(data) == 0:
         return pd.DataFrame()
@@ -4184,6 +5237,173 @@ st.markdown(
         line-height: 1.25;
     }}
 
+    .country-card-grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
+        gap: 8px;
+        margin-bottom: 12px;
+    }}
+
+    .country-card {{
+        border-radius: 10px;
+        padding: 10px 10px 9px 10px;
+        min-height: 86px;
+        color: #ffffff;
+    }}
+
+    .country-card-title {{
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.15;
+        margin-bottom: 3px;
+    }}
+
+    .country-card-meta {{
+        font-size: 10px;
+        font-weight: 600;
+        opacity: 0.92;
+        margin-bottom: 10px;
+        letter-spacing: 0.03em;
+    }}
+
+    .country-card-value {{
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1.0;
+        margin-bottom: 0;
+    }}
+
+    .region-card-shell {{
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-bottom: 12px;
+    }}
+
+    .region-card-row {{
+        display: flex;
+        gap: 10px;
+        width: 100%;
+        align-items: stretch;
+    }}
+
+    .region-global-card,
+    .region-card {{
+        border-radius: 12px;
+        padding: 12px 14px;
+        min-height: 118px;
+        color: #ffffff;
+        box-sizing: border-box;
+    }}
+
+    .region-card-title {{
+        font-size: 20px;
+        font-weight: 800;
+        line-height: 1.1;
+        margin-bottom: 4px;
+    }}
+
+    .region-card-meta {{
+        font-size: 12px;
+        font-weight: 600;
+        opacity: 0.86;
+        margin-bottom: 18px;
+        letter-spacing: 0.02em;
+    }}
+
+    .region-card-value {{
+        font-size: 30px;
+        font-weight: 800;
+        line-height: 1.0;
+        margin-bottom: 0;
+    }}
+
+    .patchwork-shell {{
+        margin-bottom: 14px;
+    }}
+
+    .patchwork-grid {{
+        display: grid;
+        gap: 8px 8px;
+        align-items: start;
+        margin-bottom: 12px;
+    }}
+
+    .patchwork-year-header {{
+        font-size: 16px;
+        font-weight: 800;
+        color: #444;
+        text-align: center;
+        padding-bottom: 3px;
+    }}
+
+    .patchwork-year-col {{
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }}
+
+    .patchwork-cell {{
+        border-radius: 8px;
+        min-height: 52px;
+        padding: 7px 8px 6px 8px;
+        color: #ffffff;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        box-sizing: border-box;
+    }}
+
+    .patchwork-cell-country {{
+        font-size: 11px;
+        font-weight: 800;
+        line-height: 1.1;
+    }}
+
+    .patchwork-cell-return {{
+        font-size: 18px;
+        font-weight: 800;
+        line-height: 1.0;
+    }}
+
+    .patchwork-legend-title {{
+        font-size: 16px;
+        font-weight: 800;
+        color: #444;
+        margin-bottom: 8px;
+    }}
+
+    .patchwork-legend {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 6px 12px;
+    }}
+
+    .patchwork-legend-item {{
+        display: grid;
+        grid-template-columns: 12px 1fr auto;
+        gap: 8px;
+        align-items: center;
+        font-size: 14px;
+        color: #333;
+    }}
+
+    .patchwork-legend-swatch {{
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        display: inline-block;
+    }}
+
+    .patchwork-legend-country {{
+        font-weight: 700;
+    }}
+
+    .patchwork-legend-return {{
+        font-weight: 700;
+        white-space: nowrap;
+    }}
+
     .period-shell {{
         background: transparent;
         padding: 8px 8px 12px 8px;
@@ -4580,6 +5800,9 @@ except Exception as exc:
     st.exception(exc)
     st.stop()
 
+regions_df = load_regions_data(str(DATA_FILE), current_file_mtime)
+sectors_df = load_sectors_data(str(DATA_FILE), current_file_mtime)
+
 monthly_levels = build_monthly_index_levels(ts, mapping)
 if not monthly_levels:
     st.error(
@@ -4707,6 +5930,14 @@ with st.sidebar:
         type="primary" if st.session_state["top_page_selector"] == "Geo" else "secondary",
     ):
         st.session_state["top_page_selector"] = "Geo"
+        st.rerun()
+    if st.button(
+        PAGE_LABELS["Sector"],
+        key="sidebar_page_sector_btn",
+        use_container_width=True,
+        type="primary" if st.session_state["top_page_selector"] == "Sector" else "secondary",
+    ):
+        st.session_state["top_page_selector"] = "Sector"
         st.rerun()
     if st.button(
         PAGE_LABELS["Yield"],
@@ -5561,49 +6792,305 @@ elif page_name == "Risk":
     st.markdown(f'<div class="methodology-text">{risk_methodology}</div>', unsafe_allow_html=True)
 
 elif page_name == "Geo":
-    fx_values_df = fetch_fx_value_series()
     geo_period = st.session_state.get("geo_period_toolbar", "YTD")
-    currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, geo_period)
+    geo_neutral_currency = st.session_state.get("geo_neutral_currency_toolbar", "USD")
+    fx_values_df = fetch_fx_value_series()
+    _, currency_end_date = build_currency_performance_matrix(fx_values_df, geo_period)
+    geo_period_options = get_geo_period_options(currency_end_date, fx_values_df, geo_neutral_currency)
+    if geo_period not in geo_period_options:
+        geo_period = "MAX" if "MAX" in geo_period_options else geo_period_options[0]
+        st.session_state["geo_period_toolbar"] = geo_period
+    country_performance_df, country_end_date = build_country_performance_df(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        period_key=geo_period,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    country_series_map, country_series_end_date = build_country_series_map(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    region_series_map, region_series_end_date = build_region_series_map(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        neutral_currency=geo_neutral_currency,
+    )
+    region_performance_df, region_end_date = build_region_performance_df(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        period_key=geo_period,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
 
-    st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-    toolbar_cols = st.columns([2.2, 2.8])
+    with st.container(key="performance_analysis_toolbar"):
+        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([4.9, 1.5])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([1.38, 0.28, 1.14])
 
-    with toolbar_cols[0]:
-        st.markdown('<div class="toolbar-label">FX period</div>', unsafe_allow_html=True)
-        geo_period = st.segmented_control(
-            label="FX period",
-            options=list(FX_PERIODS.keys()),
-            default=st.session_state.get("geo_period_toolbar", "YTD"),
-            key="geo_period_toolbar",
-            label_visibility="collapsed",
-        ) or "YTD"
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+                geo_period = st.segmented_control(
+                    label="Period",
+                    options=geo_period_options,
+                    default=st.session_state.get("geo_period_toolbar", geo_period),
+                    key="geo_period_toolbar",
+                    label_visibility="collapsed",
+                ) or "YTD"
+
+            with toolbar_cols[1]:
+                st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
+                geo_neutral_currency = st.selectbox(
+                    "Currency",
+                    options=GEO_NEUTRAL_CURRENCIES,
+                    index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("geo_neutral_currency_toolbar", "USD")),
+                    key="geo_neutral_currency_toolbar",
+                    label_visibility="collapsed",
+                )
 
     if geo_period != st.session_state.get("geo_period_toolbar", "YTD"):
         st.session_state["geo_period_toolbar"] = geo_period
 
     currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, geo_period)
+    country_performance_df, country_end_date = build_country_performance_df(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        period_key=geo_period,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    country_series_map, country_series_end_date = build_country_series_map(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    region_series_map, region_series_end_date = build_region_series_map(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        neutral_currency=geo_neutral_currency,
+    )
+    region_performance_df, region_end_date = build_region_performance_df(
+        regions_df=regions_df,
+        fx_values_df=fx_values_df,
+        period_key=geo_period,
+        neutral_currency=geo_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
 
-    with toolbar_cols[1]:
-        end_date_text = currency_end_date.strftime("%d/%m/%Y") if currency_end_date is not None else "-"
-        st.markdown(
-            f"""
-            <div class="toolbar-meta">
-                Daily FX performance matrix to <b>{end_date_text}</b>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.markdown('<div class="page-section-title">Country performance</div>', unsafe_allow_html=True)
+    country_start_text = (
+        get_geo_period_start_anchor(country_end_date, geo_period, fx_values_df, geo_neutral_currency).strftime("%d/%m/%Y")
+        if country_end_date is not None
+        else "-"
+    )
+    country_end_text = country_end_date.strftime("%d/%m/%Y") if country_end_date is not None else "-"
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Country and global market performance in {geo_neutral_currency} from <b>{country_start_text}</b> to <b>{country_end_text}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.markdown('<div class="page-section-title">Currency performance</div>', unsafe_allow_html=True)
-    if currency_matrix_df.empty:
-        st.info("No FX data were available from yfinance for the selected matrix.")
+    if country_performance_df.empty:
+        st.info("No country data were available from the regions sheet tickers for the selected period.")
     else:
-        st.markdown(build_currency_matrix_html(currency_matrix_df), unsafe_allow_html=True)
+        st.markdown(build_country_tiles_html(country_performance_df), unsafe_allow_html=True)
+
+    st.markdown('<div class="page-section-title">Regional performance</div>', unsafe_allow_html=True)
+    region_start_text = (
+        get_geo_period_start_anchor(region_end_date, geo_period, fx_values_df, geo_neutral_currency).strftime("%d/%m/%Y")
+        if region_end_date is not None
+        else "-"
+    )
+    region_end_text = region_end_date.strftime("%d/%m/%Y") if region_end_date is not None else "-"
+    msci_source_date_text = MSCI_ACWI_IMI_REGION_SOURCE_DATE.strftime("%d/%m/%Y")
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Regional and global market performance in {geo_neutral_currency} from <b>{region_start_text}</b> to <b>{region_end_text}</b>. Tile widths use MSCI ACWI IMI regional weights as at <b>{msci_source_date_text}</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if region_performance_df.empty:
+        st.info("No regional data were available from the regions sheet tickers for the selected period.")
+    else:
+        st.markdown(build_region_tiles_html(region_performance_df), unsafe_allow_html=True)
+
+    st.markdown('<div class="page-section-title">Patchwork quilt</div>', unsafe_allow_html=True)
+    patchwork_view = st.segmented_control(
+        label="Patchwork view",
+        options=list(PATCHWORK_COUNTRY_SETS.keys()),
+        default=st.session_state.get("geo_patchwork_view", "Largest 10"),
+        key="geo_patchwork_view",
+        label_visibility="collapsed",
+    ) or "Largest 10"
+    country_rankings_df = (
+        fetch_companiesmarketcap_country_rankings(COMPANIESMARKETCAP_COUNTRIES_URL)
+        if patchwork_view in {"Largest 10", "Largest 20"}
+        else pd.DataFrame()
+    )
+    patchwork_series_map = region_series_map if patchwork_view == "Regional" else country_series_map
+    patchwork_end_date = region_series_end_date if patchwork_view == "Regional" else country_series_end_date
+    patchwork_labels = resolve_patchwork_labels(
+        patchwork_view,
+        list(patchwork_series_map.keys()),
+        country_rankings_df,
+    )
+    patchwork_df, patchwork_legend_df, patchwork_years = build_country_patchwork_quilt(
+        country_series_map=patchwork_series_map,
+        end_date=patchwork_end_date,
+        years_back=10,
+        include_labels=patchwork_labels,
+    )
+    patchwork_start_text = f"31/12/{patchwork_years[0]-1}" if patchwork_years else "-"
+    patchwork_end_text = f"31/12/{patchwork_years[-1]}" if patchwork_years else "-"
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Calendar-year {'regional' if patchwork_view == 'Regional' else 'country'} rankings in {geo_neutral_currency} from <b>{patchwork_start_text}</b> to <b>{patchwork_end_text}</b>. Only entries with a full 10-year calendar history are included.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if patchwork_df.empty:
+        st.info("No entries in the selected patchwork set had a full 10-year calendar history in the selected currency.")
+    else:
+        st.markdown(build_country_patchwork_html(patchwork_df, patchwork_legend_df, patchwork_years), unsafe_allow_html=True)
 
     st.markdown(
-        '<div class="methodology-text">This tab shows currency performance using daily FX rates from yfinance. '
-        'Each cell shows the performance of the row currency relative to the column currency over the selected period. '
-        'Positive values mean the row currency appreciated against the column currency.</div>',
+        '<div class="methodology-text">This tab shows country performance using the tickers on the workbook <b>regions</b> sheet where <b>Country = 1</b> and <b>Available = Yes</b>, '
+        'regional performance using the rows where <b>Region = 1</b>, plus a Global market comparator from the preferred chart series used on the growth chart. '
+        'The regional block uses MSCI ACWI IMI regional weights sourced from '
+        f'<a href="{MSCI_ACWI_IMI_REGION_SOURCE_URL}" target="_blank">MSCI</a> as at {msci_source_date_text}. '
+        'Yahoo Finance prices are converted into the selected neutral currency where quote-currency data are available. '
+        f'The <b>MAX</b> option uses a fixed start date anchored to <b>{GEO_MAX_START.strftime("%d/%m/%Y")}</b> or the selected FX history where later. '
+        'The patchwork quilt ranks each included country or region by calendar-year return, top to bottom within each year, and shows only entries with a full 10-year history across the displayed quilt window. '
+        'Using smaller curated sets such as Largest 10, Largest 20, or Regional also allows a more distinct colour palette than All countries.</div>',
+        unsafe_allow_html=True,
+    )
+
+elif page_name == "Sector":
+    sector_period = st.session_state.get("sector_period_toolbar", "YTD")
+    sector_neutral_currency = st.session_state.get("sector_neutral_currency_toolbar", "USD")
+    fx_values_df = fetch_fx_value_series()
+    _, sector_fx_end_date = build_currency_performance_matrix(fx_values_df, sector_period)
+    sector_period_options = get_geo_period_options(sector_fx_end_date, fx_values_df, sector_neutral_currency)
+    if sector_period not in sector_period_options:
+        sector_period = "MAX" if "MAX" in sector_period_options else sector_period_options[0]
+        st.session_state["sector_period_toolbar"] = sector_period
+
+    sector_performance_df, sector_end_date = build_labelled_performance_df(
+        source_df=sectors_df,
+        label_col="sector",
+        fx_values_df=fx_values_df,
+        period_key=sector_period,
+        neutral_currency=sector_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    sector_series_map, sector_series_end_date = build_labelled_series_map(
+        source_df=sectors_df,
+        label_col="sector",
+        fx_values_df=fx_values_df,
+        neutral_currency=sector_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+
+    with st.container(key="performance_analysis_toolbar"):
+        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([4.9, 1.5])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([1.38, 0.28, 1.14])
+
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+                sector_period = st.segmented_control(
+                    label="Period",
+                    options=sector_period_options,
+                    default=st.session_state.get("sector_period_toolbar", sector_period),
+                    key="sector_period_toolbar",
+                    label_visibility="collapsed",
+                ) or "YTD"
+
+            with toolbar_cols[1]:
+                st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
+                sector_neutral_currency = st.selectbox(
+                    "Currency",
+                    options=GEO_NEUTRAL_CURRENCIES,
+                    index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("sector_neutral_currency_toolbar", "USD")),
+                    key="sector_neutral_currency_toolbar",
+                    label_visibility="collapsed",
+                )
+
+    sector_performance_df, sector_end_date = build_labelled_performance_df(
+        source_df=sectors_df,
+        label_col="sector",
+        fx_values_df=fx_values_df,
+        period_key=sector_period,
+        neutral_currency=sector_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+    sector_series_map, sector_series_end_date = build_labelled_series_map(
+        source_df=sectors_df,
+        label_col="sector",
+        fx_values_df=fx_values_df,
+        neutral_currency=sector_neutral_currency,
+        preferred_series_map=chart_series_map,
+    )
+
+    st.markdown('<div class="page-section-title">Sector performance</div>', unsafe_allow_html=True)
+    sector_start_text = (
+        get_geo_period_start_anchor(sector_end_date, sector_period, fx_values_df, sector_neutral_currency).strftime("%d/%m/%Y")
+        if sector_end_date is not None
+        else "-"
+    )
+    sector_end_text = sector_end_date.strftime("%d/%m/%Y") if sector_end_date is not None else "-"
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Sector performance in {sector_neutral_currency} from <b>{sector_start_text}</b> to <b>{sector_end_text}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if sector_performance_df.empty:
+        st.info("No sector data were available from the sectors sheet tickers for the selected period.")
+    else:
+        st.markdown(build_label_tiles_html(sector_performance_df), unsafe_allow_html=True)
+
+    st.markdown('<div class="page-section-title">Patchwork quilt</div>', unsafe_allow_html=True)
+    sector_patchwork_df, sector_patchwork_legend_df, sector_patchwork_years = build_country_patchwork_quilt(
+        country_series_map=sector_series_map,
+        end_date=sector_series_end_date,
+        years_back=10,
+    )
+    sector_patchwork_start_text = f"31/12/{sector_patchwork_years[0]-1}" if sector_patchwork_years else "-"
+    sector_patchwork_end_text = f"31/12/{sector_patchwork_years[-1]}" if sector_patchwork_years else "-"
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Calendar-year sector rankings in {sector_neutral_currency} from <b>{sector_patchwork_start_text}</b> to <b>{sector_patchwork_end_text}</b>. Only sectors with a full 10-year calendar history are included.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if sector_patchwork_df.empty:
+        st.info("No sectors had a full 10-year calendar history in the selected currency.")
+    else:
+        st.markdown(build_country_patchwork_html(sector_patchwork_df, sector_patchwork_legend_df, sector_patchwork_years), unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="methodology-text">This tab shows sector performance using the tickers on the workbook <b>sectors</b> sheet where <b>Available = Yes</b>. '
+        'Yahoo Finance prices are converted into the selected neutral currency where quote-currency data are available. '
+        f'The <b>MAX</b> option uses a fixed start date anchored to <b>{GEO_MAX_START.strftime("%d/%m/%Y")}</b> or the selected FX history where later. '
+        'The patchwork quilt ranks each included sector by calendar-year return, top to bottom within each year, and shows only sectors with a full 10-year history across the displayed quilt window.</div>',
         unsafe_allow_html=True,
     )
 
@@ -5668,12 +7155,54 @@ else:
     else:
         st.altair_chart(build_global_yield_curve_chart(global_yield_curve_df), width="stretch")
 
+    fx_values_df = fetch_fx_value_series()
+    fx_period = st.session_state.get("rates_fx_period_toolbar", "YTD")
+    currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, fx_period)
+    fx_period_options = get_fx_period_options(currency_end_date, fx_values_df)
+
+    st.markdown('<div class="page-section-title">Currency performance</div>', unsafe_allow_html=True)
+    with st.container(key="performance_analysis_toolbar"):
+        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
+        toolbar_wrap_cols = st.columns([5.1, 1.3])
+        with toolbar_wrap_cols[0]:
+            toolbar_cols = st.columns([1.55, 1.15])
+            with toolbar_cols[0]:
+                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+                fx_period = st.segmented_control(
+                    label="FX period",
+                    options=fx_period_options,
+                    default=st.session_state.get("rates_fx_period_toolbar", fx_period),
+                    key="rates_fx_period_toolbar",
+                    label_visibility="collapsed",
+                ) or "YTD"
+
+    currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, fx_period)
+    currency_start_text = (
+        get_fx_period_start_anchor(currency_end_date, fx_period, fx_values_df).strftime("%d/%m/%Y")
+        if currency_end_date is not None
+        else "-"
+    )
+    end_date_text = currency_end_date.strftime("%d/%m/%Y") if currency_end_date is not None else "-"
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            Daily FX performance matrix from <b>{currency_start_text}</b> to <b>{end_date_text}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if currency_matrix_df.empty:
+        st.info("No FX data were available from yfinance for the selected matrix.")
+    else:
+        st.markdown(build_currency_matrix_html(currency_matrix_df), unsafe_allow_html=True)
+
     yield_note = (
         "Latest nominal and real UK spot curves are fetched from the Bank of England yield-curve archive. "
         "The app reads the latest non-blank dated row from the '4. spot curve' sheet in the current-month nominal and real daily workbooks. "
         "Where DividendData provides shorter-maturity index-linked gilts than the Bank of England real curve, those short-end gilt real yields are prepended to extend the real curve only below the first BOE real maturity. "
         "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available. "
-        "The global chart fetches the latest nominal yield-curve tables from WorldGovernmentBonds country pages and plots the 'Last' annualised yield column for the ten largest government bond markets."
+        "The global chart fetches the latest nominal yield-curve tables from WorldGovernmentBonds country pages and plots the 'Last' annualised yield column for the ten largest government bond markets. "
+        "The FX matrix shows daily row-versus-column currency performance from yfinance over the selected period."
     )
     st.markdown(f'<div class="methodology-text">{yield_note}</div>', unsafe_allow_html=True)
 
