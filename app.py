@@ -1479,6 +1479,67 @@ def build_factor_style_box_html(style_box_df: pd.DataFrame) -> str:
     )
 
 
+def build_factor_spread_df(style_box_df: pd.DataFrame) -> pd.DataFrame:
+    if style_box_df.empty:
+        return pd.DataFrame(columns=["label", "value"])
+
+    grid = style_box_df.pivot(index="size_style", columns="value_style", values="performance")
+
+    def _get(row: str, col: str) -> float:
+        if row not in grid.index or col not in grid.columns:
+            return np.nan
+        return float(grid.loc[row, col])
+
+    small_vals = pd.to_numeric(
+        pd.Series([_get("Small", "Value"), _get("Small", "Core"), _get("Small", "Growth")]), errors="coerce"
+    ).dropna()
+    large_vals = pd.to_numeric(
+        pd.Series([_get("Large", "Value"), _get("Large", "Core"), _get("Large", "Growth")]), errors="coerce"
+    ).dropna()
+    value_vals = pd.to_numeric(
+        pd.Series([_get("Large", "Value"), _get("Mid", "Value"), _get("Small", "Value")]), errors="coerce"
+    ).dropna()
+    growth_vals = pd.to_numeric(
+        pd.Series([_get("Large", "Growth"), _get("Mid", "Growth"), _get("Small", "Growth")]), errors="coerce"
+    ).dropna()
+
+    spreads = [
+        {
+            "label": "Small - Large",
+            "value": small_vals.mean() - large_vals.mean() if not small_vals.empty and not large_vals.empty else np.nan,
+        },
+        {
+            "label": "Value - Growth",
+            "value": value_vals.mean() - growth_vals.mean() if not value_vals.empty and not growth_vals.empty else np.nan,
+        },
+        {
+            "label": "Small Value - Large Growth",
+            "value": _get("Small", "Value") - _get("Large", "Growth"),
+        },
+    ]
+    return pd.DataFrame(spreads)
+
+
+def build_factor_spread_cards_html(spread_df: pd.DataFrame) -> str:
+    if spread_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No factor spread data available.</div></div>'
+
+    cards = []
+    for row in spread_df.itertuples():
+        value = row.value
+        colour = BRAND_ORANGE if pd.notna(value) else MID_GREY
+        cards.append(
+            '<div class="factor-spread-card">'
+            f'<div class="factor-spread-accent" style="background:{colour};"></div>'
+            '<div class="factor-spread-content">'
+            f'<div class="factor-spread-label">{row.label}</div>'
+            f'<div class="factor-spread-value">{format_pct(float(value)) if pd.notna(value) else "-"}</div>'
+            "</div>"
+            "</div>"
+        )
+    return f'<div class="factor-spread-stack">{"".join(cards)}</div>'
+
+
 def build_region_tiles_html(region_df: pd.DataFrame) -> str:
     if region_df.empty:
         return '<div class="table-shell"><div class="table-empty">No regional data available.</div></div>'
@@ -6141,6 +6202,52 @@ st.markdown(
         color: #9a9a9a;
     }}
 
+    .factor-spread-stack {{
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        margin: 6px 0 10px 0;
+    }}
+
+    .factor-spread-card {{
+        display: flex;
+        align-items: stretch;
+        min-height: 92px;
+        background: {WHITE};
+        border: 0.2px solid {MID_GREY};
+        border-radius: 12px;
+        overflow: hidden;
+    }}
+
+    .factor-spread-accent {{
+        width: 4px;
+        flex: 0 0 4px;
+    }}
+
+    .factor-spread-content {{
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 8px;
+        padding: 14px 16px;
+        width: 100%;
+        box-sizing: border-box;
+    }}
+
+    .factor-spread-label {{
+        font-size: 15px;
+        font-weight: 700;
+        color: {TEXT_GREY};
+        line-height: 1.2;
+    }}
+
+    .factor-spread-value {{
+        font-size: 28px;
+        font-weight: 700;
+        color: #111111;
+        line-height: 1;
+    }}
+
     .country-card-grid {{
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
@@ -7737,8 +7844,11 @@ elif page_name == "Factors":
     if factor_style_box_df.empty:
         st.info("No US factor data were available from the factors sheet tickers for the selected period.")
     else:
-        style_box_cols = st.columns([0.9, 1.2, 0.9])
-        with style_box_cols[1]:
+        factor_spread_df = build_factor_spread_df(factor_style_box_df)
+        factor_layout_cols = st.columns([1.0, 0.16, 1.8])
+        with factor_layout_cols[0]:
+            st.markdown(build_factor_spread_cards_html(factor_spread_df), unsafe_allow_html=True)
+        with factor_layout_cols[2]:
             st.markdown(build_factor_style_box_html(factor_style_box_df), unsafe_allow_html=True)
 
     st.markdown(
