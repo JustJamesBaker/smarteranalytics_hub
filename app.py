@@ -37,6 +37,7 @@ TIME_SERIES_SHEET = "time_series"
 MAPPING_SHEET = "mapping"
 REGIONS_SHEET = "regions"
 SECTORS_SHEET = "sectors"
+FACTORS_SHEET = "factors"
 
 BRAND_ORANGE = "#f36f21"
 BRAND_ORANGE_DARK = "#d65f17"
@@ -50,6 +51,7 @@ PAGE_LABELS = {
     "Dashboard": "Market snapshot",
     "Charts": "Performance analysis",
     "Risk": "Risk analysis",
+    "Factors": "Risk factors",
     "Geo": "Geographic analysis",
     "Sector": "Sector analysis",
     "Yield": "Rates & FX",
@@ -308,6 +310,8 @@ ONS_CPI_INDEX_CSV_URL = (
     "/economy/inflationandpriceindices/timeseries/d7bt/mm23"
 )
 BOE_YIELD_CURVE_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/latest-yield-curve-data.zip"
+BOE_NOMINAL_MONTH_END_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/glcnominalmonthedata.zip"
+BOE_REAL_MONTH_END_ZIP_URL = "https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/glcrealmonthedata.zip"
 DIVIDENDDATA_INDEX_LINKED_GILTS_URL = "https://www.dividenddata.co.uk/index-linked-gilts-prices-yields.py"
 DIVIDENDDATA_GILT_DETAIL_URL = "https://www.dividenddata.co.uk/gilts.py?ticker={ticker}"
 DIVIDENDDATA_SHORT_END_TICKERS = ["TR26", "T27", "T28", "T29", "TR31"]
@@ -363,6 +367,7 @@ FX_PERIODS = {
     "20Y": "20Y",
     "MAX": "MAX",
 }
+UK_HISTORICAL_YIELD_PERIODS = ["YTD", "1Y", "3Y", "5Y", "10Y", "MAX"]
 
 DEFAULT_ASSET_ORDER = [
     "Global stocks",
@@ -484,6 +489,24 @@ def heat_colour(value: float, vmin: float, vmax: float) -> str:
     dark = np.array([190, 30, 55])
     rgb = (light * (1 - norm) + dark * norm).astype(int)
     return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def text_colour_for_background(background: str) -> str:
+    if not isinstance(background, str):
+        return "#111111"
+
+    rgb_match = re.match(r"rgb\((\d+),(\d+),(\d+)\)", background.replace(" ", ""))
+    if rgb_match:
+        r, g, b = [int(rgb_match.group(i)) for i in range(1, 4)]
+    elif background.startswith("#") and len(background) == 7:
+        r = int(background[1:3], 16)
+        g = int(background[3:5], 16)
+        b = int(background[5:7], 16)
+    else:
+        return "#111111"
+
+    luminance = (0.299 * r) + (0.587 * g) + (0.114 * b)
+    return "#111111" if luminance >= 165 else "#ffffff"
 
 
 def get_series_map_bounds(series_map: dict[str, pd.Series]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
@@ -612,6 +635,23 @@ def get_geo_period_options(end_date: pd.Timestamp | None, fx_values_df: pd.DataF
         options.append("20Y")
     options.append("MAX")
     return options
+
+
+def get_common_series_inception_anchor(
+    series_map: dict[str, pd.Series],
+    include_labels: set[str] | None = None,
+) -> pd.Timestamp | None:
+    start_dates: list[pd.Timestamp] = []
+    for label, series in series_map.items():
+        if include_labels is not None and str(label) not in include_labels:
+            continue
+        s = series.dropna().sort_index()
+        if s.empty:
+            continue
+        start_dates.append(pd.Timestamp(s.index.min()).normalize())
+    if not start_dates:
+        return None
+    return max(start_dates)
 
 
 @st.cache_data(show_spinner=False, ttl=43200)
@@ -951,6 +991,7 @@ def build_labelled_performance_df(
     period_key: str,
     neutral_currency: str = "USD",
     preferred_series_map: dict[str, pd.Series] | None = None,
+    max_start_anchor: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.Timestamp | None]:
     series_map, end_date = build_labelled_series_map(
         source_df,
@@ -962,7 +1003,11 @@ def build_labelled_performance_df(
     if not series_map or end_date is None:
         return pd.DataFrame(), None
 
-    start_anchor = get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    start_anchor = (
+        pd.Timestamp(max_start_anchor).normalize()
+        if period_key == "MAX" and max_start_anchor is not None
+        else get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    )
     rows = []
     for label, series in series_map.items():
         performance = calc_period_return(
@@ -982,6 +1027,85 @@ def build_labelled_performance_df(
     return out, end_date
 
 
+@st.cache_data(show_spinner=False)
+def build_factor_style_box_df(
+    factors_df: pd.DataFrame,
+    fx_values_df: pd.DataFrame,
+    period_key: str,
+    neutral_currency: str = "USD",
+    region_key: str = "US",
+) -> tuple[pd.DataFrame, pd.Timestamp | None, pd.Timestamp | None, pd.Timestamp | None]:
+    empty = pd.DataFrame(columns=["label", "name", "ticker", "size_style", "value_style", "performance"])
+    if factors_df.empty:
+        return empty, None, None, None
+
+    working = factors_df[
+        factors_df["available"].fillna(False)
+        & factors_df["region"].map(canonical_factor_region).eq(canonical_factor_region(region_key))
+    ].copy()
+    if working.empty:
+        return empty, None, None, None
+
+    working["size_style"] = working["size_style"].map(canonical_factor_size_style)
+    working["value_style"] = working["value_style"].map(canonical_factor_value_style)
+    working["label"] = working["label"].astype(str).str.strip()
+    working = working[
+        working["size_style"].isin(["Large", "Mid", "Small"]) & working["value_style"].isin(["Value", "Core", "Growth"])
+    ].copy()
+    if working.empty:
+        return empty, None, None, None
+
+    series_map, end_date = build_labelled_series_map(
+        source_df=working,
+        label_col="label",
+        fx_values_df=fx_values_df,
+        neutral_currency=neutral_currency,
+    )
+    if not series_map or end_date is None:
+        return empty, None, None, None
+
+    common_start = get_common_series_inception_anchor(series_map, include_labels=set(working["label"].tolist()))
+    if common_start is None:
+        return empty, None, end_date, None
+
+    start_anchor = (
+        pd.Timestamp(common_start).normalize()
+        if period_key == "MAX"
+        else get_geo_period_start_anchor(end_date, period_key, fx_values_df, neutral_currency)
+    )
+
+    rows = []
+    for row in working.itertuples():
+        label = str(row.label).strip()
+        series = series_map.get(label, pd.Series(dtype=float)).dropna().sort_index()
+        if series.empty:
+            continue
+        performance = calc_period_return(
+            series,
+            end_date,
+            "Period" if period_key == "MAX" else period_key,
+            whole_period_start=start_anchor,
+        )
+        if pd.isna(performance):
+            continue
+        rows.append(
+            {
+                "label": label,
+                "name": str(row.name).strip(),
+                "ticker": normalise_ticker(row.ticker),
+                "size_style": str(row.size_style).strip(),
+                "value_style": str(row.value_style).strip(),
+                "performance": performance,
+            }
+        )
+
+    if not rows:
+        return empty, start_anchor, end_date, common_start
+
+    out = pd.DataFrame(rows).drop_duplicates(subset=["size_style", "value_style"], keep="first")
+    return out, start_anchor, end_date, common_start
+
+
 def canonical_region_name(name: object) -> str:
     raw = str(name).strip()
     normalized = re.sub(r"[^a-z]+", "", raw.lower())
@@ -999,6 +1123,45 @@ def canonical_region_name(name: object) -> str:
         "em": "Emerging",
     }
     return aliases.get(normalized, raw)
+
+
+def canonical_factor_region(value: object) -> str:
+    raw = str(value).strip()
+    normalized = re.sub(r"[^a-z]+", "", raw.lower())
+    aliases = {
+        "us": "US",
+        "usa": "US",
+        "unitedstates": "US",
+        "unitedstatesofamerica": "US",
+    }
+    return aliases.get(normalized, raw.upper() if len(raw) <= 3 else raw)
+
+
+def canonical_factor_size_style(value: object) -> str:
+    raw = str(value).strip()
+    normalized = re.sub(r"[^a-z]+", "", raw.lower())
+    aliases = {
+        "large": "Large",
+        "largecap": "Large",
+        "mid": "Mid",
+        "midcap": "Mid",
+        "medium": "Mid",
+        "small": "Small",
+        "smallcap": "Small",
+    }
+    return aliases.get(normalized, raw.title())
+
+
+def canonical_factor_value_style(value: object) -> str:
+    raw = str(value).strip()
+    normalized = re.sub(r"[^a-z]+", "", raw.lower())
+    aliases = {
+        "value": "Value",
+        "core": "Core",
+        "blend": "Core",
+        "growth": "Growth",
+    }
+    return aliases.get(normalized, raw.title())
 
 
 def infer_canonical_region(row: pd.Series | object) -> str:
@@ -1275,6 +1438,47 @@ def build_label_tiles_html(label_df: pd.DataFrame) -> str:
     return f'<div class="country-card-grid">{"".join(cards)}</div>'
 
 
+def build_factor_style_box_html(style_box_df: pd.DataFrame) -> str:
+    if style_box_df.empty:
+        return '<div class="table-shell"><div class="table-empty">No factor style-box data available.</div></div>'
+
+    row_order = ["Large", "Mid", "Small"]
+    col_order = ["Value", "Core", "Growth"]
+    grid = (
+        style_box_df.pivot(index="size_style", columns="value_style", values="performance")
+        .reindex(index=row_order, columns=col_order)
+    )
+    values = pd.to_numeric(style_box_df["performance"], errors="coerce").dropna()
+    vmin = float(values.min()) if not values.empty else -0.1
+    vmax = float(values.max()) if not values.empty else 0.1
+
+    header_cells = ['<div class="factor-style-header factor-style-corner">Size \\ Style</div>']
+    header_cells.extend(f'<div class="factor-style-header">{column}</div>' for column in col_order)
+
+    body_cells = []
+    for row_name in row_order:
+        body_cells.append(f'<div class="factor-style-row-label">{row_name}</div>')
+        for col_name in col_order:
+            value = grid.loc[row_name, col_name]
+            if pd.isna(value):
+                body_cells.append('<div class="factor-style-cell factor-style-cell-empty">-</div>')
+                continue
+            background = heat_colour(float(value), vmin, vmax)
+            text_colour = text_colour_for_background(background)
+            body_cells.append(
+                f'<div class="factor-style-cell" style="background:{background};color:{text_colour};">{format_pct(float(value))}</div>'
+            )
+
+    return (
+        '<div class="factor-style-shell">'
+        '<div class="factor-style-grid">'
+        f'{"".join(header_cells)}'
+        f'{"".join(body_cells)}'
+        "</div>"
+        "</div>"
+    )
+
+
 def build_region_tiles_html(region_df: pd.DataFrame) -> str:
     if region_df.empty:
         return '<div class="table-shell"><div class="table-empty">No regional data available.</div></div>'
@@ -1357,7 +1561,7 @@ def build_country_patchwork_quilt(
         return pd.DataFrame(), pd.DataFrame(), []
 
     returns_by_country: dict[str, dict[int, float]] = {}
-    period_summary_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
     quilt_start = pd.Timestamp(years[0] - 1, 12, 31)
     quilt_end = pd.Timestamp(years[-1], 12, 31)
 
@@ -1380,8 +1584,15 @@ def build_country_patchwork_quilt(
             continue
 
         period_return = calc_period_return(s, quilt_end, "Period", whole_period_start=quilt_start)
+        ytd_return = calc_period_return(s, end_ts, "YTD")
         returns_by_country[country] = yearly_returns
-        period_summary_rows.append({"country": country, "period_return": period_return})
+        summary_rows.append(
+            {
+                "country": country,
+                "period_return": period_return,
+                "ytd_return": ytd_return,
+            }
+        )
 
     if not returns_by_country:
         return pd.DataFrame(), pd.DataFrame(), years
@@ -1409,8 +1620,14 @@ def build_country_patchwork_quilt(
             )
 
     quilt_df = pd.DataFrame(quilt_rows)
-    legend_df = pd.DataFrame(period_summary_rows).sort_values(["period_return", "country"], ascending=[False, True]).reset_index(drop=True)
-    return quilt_df, legend_df, years
+    summary_df = pd.DataFrame(summary_rows)
+    if summary_df.empty:
+        return quilt_df, summary_df, years
+
+    summary_df["ytd_rank"] = summary_df["ytd_return"].rank(method="first", ascending=False, na_option="bottom")
+    summary_df["period_rank"] = summary_df["period_return"].rank(method="first", ascending=False, na_option="bottom")
+    summary_df = summary_df.sort_values(["country"]).reset_index(drop=True)
+    return quilt_df, summary_df, years
 
 
 def resolve_patchwork_labels(
@@ -1442,13 +1659,12 @@ def resolve_patchwork_labels(
     return labels
 
 
-def build_country_patchwork_html(quilt_df: pd.DataFrame, legend_df: pd.DataFrame, years: list[int]) -> str:
-    if quilt_df.empty or legend_df.empty or not years:
+def build_country_patchwork_html(quilt_df: pd.DataFrame, summary_df: pd.DataFrame, years: list[int]) -> str:
+    if quilt_df.empty or summary_df.empty or not years:
         return '<div class="table-shell"><div class="table-empty">No patchwork-quilt data available.</div></div>'
 
-    countries = legend_df["country"].astype(str).tolist()
+    countries = summary_df["country"].astype(str).tolist()
     colour_map = build_distinct_colour_map(countries)
-    max_rank = int(quilt_df["max_rank"].max())
 
     header_html = "".join(f'<div class="patchwork-year-header">{year}</div>' for year in years)
     body_cols = []
@@ -1465,24 +1681,35 @@ def build_country_patchwork_html(quilt_df: pd.DataFrame, legend_df: pd.DataFrame
             )
         body_cols.append(f'<div class="patchwork-year-col">{"".join(cell_html)}</div>')
 
-    legend_items = []
-    for _, row in legend_df.iterrows():
-        country = str(row["country"])
-        legend_items.append(
-            f'<div class="patchwork-legend-item">'
-            f'<span class="patchwork-legend-swatch" style="background:{colour_map[country]};"></span>'
-            f'<span class="patchwork-legend-country">{country}</span>'
-            f'<span class="patchwork-legend-return">{format_pct(float(row["period_return"]))}</span>'
-            f'</div>'
+    metric_defs = [
+        ("YTD", "ytd_return", "ytd_rank"),
+        ("Whole period", "period_return", "period_rank"),
+    ]
+    metric_headers = "".join(
+        f'<div class="patchwork-year-header patchwork-metric-header">{label}</div>' for label, _, _ in metric_defs
+    )
+    metric_cols = []
+    for _, metric_key, rank_key in metric_defs:
+        metric_rows = summary_df.sort_values([rank_key, "country"], ascending=[True, True])
+        cell_html = []
+        for _, row in metric_rows.iterrows():
+            country = str(row["country"])
+            value = pd.to_numeric(pd.Series([row.get(metric_key)]), errors="coerce").iloc[0]
+            cell_html.append(
+                f'<div class="patchwork-cell patchwork-summary-cell" style="background:{colour_map[country]};">'
+                f'<div class="patchwork-cell-country">{country}</div>'
+                f'<div class="patchwork-cell-return">{format_pct(float(value))}</div>'
+                f'</div>'
+            )
+        metric_cols.append(
+            f'<div class="patchwork-year-col patchwork-metric-col">{"".join(cell_html)}</div>'
         )
 
     return (
         '<div class="patchwork-shell">'
-        f'<div class="patchwork-grid" style="grid-template-columns: repeat({len(years)}, minmax(92px, 1fr));">'
-        f"{header_html}{''.join(body_cols)}"
-        '</div>'
-        '<div class="patchwork-legend-title">Legend and displayed-period return</div>'
-        f'<div class="patchwork-legend">{"".join(legend_items)}</div>'
+        f'<div class="patchwork-grid" style="grid-template-columns: repeat({len(years)}, minmax(92px, 1fr)) repeat({len(metric_defs)}, minmax(100px, 1fr));">'
+        f"{header_html}{metric_headers}{''.join(body_cols)}{''.join(metric_cols)}"
+        "</div>"
         "</div>"
     )
 
@@ -2563,6 +2790,63 @@ def parse_boe_spot_curve_workbook(workbook_bytes: bytes, curve_type: str) -> tup
     return points.sort_values("maturity_years"), curve_date, preview
 
 
+def parse_boe_spot_curve_history_workbook(workbook_bytes: bytes, curve_type: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw = pd.read_excel(BytesIO(workbook_bytes), sheet_name="4. spot curve", header=None)
+    if raw.shape[0] < 6 or raw.shape[1] < 2:
+        raise ValueError(f"BOE {curve_type} spot curve history sheet is missing expected rows/columns.")
+
+    candidate_rows = []
+    for row_idx in range(min(10, len(raw))):
+        parsed_row = raw.iloc[row_idx, 1:].map(parse_maturity_label)
+        candidate_rows.append((row_idx, int(parsed_row.notna().sum()), parsed_row))
+
+    maturity_row_idx, maturity_count, maturities = max(candidate_rows, key=lambda x: x[1])
+    if maturity_count == 0:
+        raise ValueError(f"BOE {curve_type} spot curve history maturities could not be parsed.")
+
+    data_rows = raw.iloc[maturity_row_idx + 1 :, :].copy()
+    data_rows = data_rows.rename(columns={0: "date_raw"})
+    data_rows["curve_date"] = pd.to_datetime(data_rows["date_raw"], errors="coerce")
+    value_block = data_rows.iloc[:, 1 : 1 + len(maturities)].apply(pd.to_numeric, errors="coerce")
+
+    valid_mask = data_rows["curve_date"].notna() & value_block.notna().any(axis=1)
+    valid_rows = data_rows.loc[valid_mask].copy()
+    valid_values = value_block.loc[valid_mask].copy()
+    if valid_rows.empty:
+        raise ValueError(f"BOE {curve_type} spot curve history sheet had no valid dated rows.")
+
+    frames = []
+    for idx in valid_rows.index:
+        curve_date = pd.Timestamp(valid_rows.loc[idx, "curve_date"]).normalize()
+        frame = pd.DataFrame(
+            {
+                "maturity_years": pd.to_numeric(maturities, errors="coerce"),
+                "yield_percent": pd.to_numeric(valid_values.loc[idx], errors="coerce"),
+                "curve_type": curve_type,
+                "curve_date": curve_date,
+            }
+        ).dropna(subset=["maturity_years", "yield_percent"])
+        if frame.empty:
+            continue
+        frames.append(frame)
+
+    if not frames:
+        raise ValueError(f"BOE {curve_type} spot curve history rows contained no valid points.")
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.sort_values(["curve_date", "maturity_years"]).drop_duplicates(
+        subset=["curve_date", "maturity_years", "curve_type"],
+        keep="last",
+    )
+
+    preview = valid_rows[["curve_date"]].copy()
+    preview["points_available"] = valid_values.notna().sum(axis=1).values
+    preview["curve_type"] = curve_type
+    preview["maturity_row_idx"] = maturity_row_idx + 1
+    preview["curve_date"] = pd.to_datetime(preview["curve_date"], errors="coerce")
+    return out.reset_index(drop=True), preview
+
+
 def fetch_dividenddata_real_yield_extension(page_url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     html = fetch_dividenddata_html(page_url)
     try:
@@ -2709,6 +2993,106 @@ def build_boe_yield_curve_diagnostics(zip_url: str, dividenddata_url: str) -> tu
             ]
         )
         return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"]), summary, pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def build_boe_month_end_yield_curve_history(
+    nominal_zip_url: str,
+    real_zip_url: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    try:
+        nominal_zip_bytes = fetch_boe_yield_curve_zip(nominal_zip_url)
+        real_zip_bytes = fetch_boe_yield_curve_zip(real_zip_url)
+
+        curve_frames = []
+        preview_frames = []
+        nominal_members_loaded: list[str] = []
+        real_members_loaded: list[str] = []
+
+        with zipfile.ZipFile(BytesIO(nominal_zip_bytes)) as zf:
+            nominal_members = [name for name in zf.namelist() if name.lower().endswith(".xlsx")]
+            for member in sorted(nominal_members):
+                points, preview = parse_boe_spot_curve_history_workbook(zf.read(member), "Nominal")
+                points["source"] = "BOE month end"
+                points["workbook"] = member
+                preview["workbook"] = member
+                curve_frames.append(points)
+                preview_frames.append(preview)
+                nominal_members_loaded.append(member)
+
+        with zipfile.ZipFile(BytesIO(real_zip_bytes)) as zf:
+            real_members = [name for name in zf.namelist() if name.lower().endswith(".xlsx")]
+            for member in sorted(real_members):
+                points, preview = parse_boe_spot_curve_history_workbook(zf.read(member), "Real")
+                points["source"] = "BOE month end"
+                points["workbook"] = member
+                preview["workbook"] = member
+                curve_frames.append(points)
+                preview_frames.append(preview)
+                real_members_loaded.append(member)
+
+        history_df = pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame()
+        if not history_df.empty:
+            history_df["curve_date"] = pd.to_datetime(history_df["curve_date"], errors="coerce").dt.normalize()
+            history_df = history_df.dropna(subset=["curve_date", "maturity_years", "yield_percent", "curve_type"])
+            history_df = history_df.sort_values(["curve_type", "curve_date", "maturity_years", "workbook"]).drop_duplicates(
+                subset=["curve_type", "curve_date", "maturity_years"],
+                keep="last",
+            )
+
+        preview = pd.concat(preview_frames, ignore_index=True) if preview_frames else pd.DataFrame()
+        if not preview.empty:
+            preview["curve_date"] = pd.to_datetime(preview["curve_date"], errors="coerce")
+
+        nominal_dates = (
+            history_df.loc[history_df["curve_type"] == "Nominal", "curve_date"].dropna().drop_duplicates().sort_values()
+            if not history_df.empty
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        real_dates = (
+            history_df.loc[history_df["curve_type"] == "Real", "curve_date"].dropna().drop_duplicates().sort_values()
+            if not history_df.empty
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        common_dates = nominal_dates[nominal_dates.isin(set(real_dates.tolist()))] if not nominal_dates.empty and not real_dates.empty else pd.Series(dtype="datetime64[ns]")
+
+        summary = pd.DataFrame(
+            [
+                {"metric": "Fetch status", "value": "OK"},
+                {"metric": "Nominal source URL", "value": nominal_zip_url},
+                {"metric": "Real source URL", "value": real_zip_url},
+                {"metric": "Nominal workbooks", "value": int(len(nominal_members_loaded))},
+                {"metric": "Real workbooks", "value": int(len(real_members_loaded))},
+                {"metric": "Nominal month-end dates", "value": int(len(nominal_dates))},
+                {"metric": "Real month-end dates", "value": int(len(real_dates))},
+                {"metric": "Common month-end dates", "value": int(len(common_dates))},
+                {
+                    "metric": "Latest common month end",
+                    "value": "-" if common_dates.empty else pd.Timestamp(common_dates.max()).strftime("%d/%m/%Y"),
+                },
+                {"metric": "Total points", "value": int(len(history_df))},
+            ]
+        )
+
+        if not preview.empty:
+            preview["curve_date"] = preview["curve_date"].dt.strftime("%d/%m/%Y").fillna("")
+
+        return history_df.reset_index(drop=True), summary, preview
+    except Exception as exc:
+        summary = pd.DataFrame(
+            [
+                {"metric": "Fetch status", "value": "Failed"},
+                {"metric": "Nominal source URL", "value": nominal_zip_url},
+                {"metric": "Real source URL", "value": real_zip_url},
+                {"metric": "Error type", "value": type(exc).__name__},
+                {"metric": "Error", "value": str(exc)},
+            ]
+        )
+        return (
+            pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date", "source", "workbook"]),
+            summary,
+            pd.DataFrame(),
+        )
 
 
 @st.cache_data(show_spinner=False, ttl=21600)
@@ -3147,6 +3531,56 @@ def load_sectors_data(file_path: str, file_mtime: float) -> pd.DataFrame:
     sectors = sectors[sectors["ticker"].astype(str).str.len() > 0].copy()
     sectors = sectors.drop_duplicates(subset=["ticker"], keep="first")
     return sectors[["ticker", "name", "sector", "available"]]
+
+
+@st.cache_data(show_spinner=False)
+def load_factors_data(file_path: str, file_mtime: float) -> pd.DataFrame:
+    try:
+        factors = pd.read_excel(file_path, sheet_name=FACTORS_SHEET)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "region", "size_style", "value_style", "label", "available"])
+
+    factors.columns = [str(c).strip() for c in factors.columns]
+    factors = factors.copy()
+
+    normalized_cols = {str(c).strip().lower(): str(c).strip() for c in factors.columns}
+    rename_map = {}
+    explicit_name_map = {
+        "ticker": "ticker",
+        "name": "name",
+        "region": "region",
+        "size": "size_style",
+        "size style": "size_style",
+        "value": "value_style",
+        "value style": "value_style",
+        "final": "label",
+        "available": "available",
+    }
+    for source_name, target_name in explicit_name_map.items():
+        if source_name in normalized_cols:
+            rename_map[normalized_cols[source_name]] = target_name
+    factors = factors.rename(columns=rename_map)
+
+    if "ticker" not in factors.columns:
+        return pd.DataFrame(columns=["ticker", "name", "region", "size_style", "value_style", "label", "available"])
+
+    factors["ticker"] = factors["ticker"].map(normalise_ticker)
+    factors["name"] = factors.get("name", factors["ticker"]).astype(str).str.strip()
+    factors["region"] = factors.get("region", "").map(canonical_factor_region)
+    factors["size_style"] = factors.get("size_style", "").map(canonical_factor_size_style)
+    factors["value_style"] = factors.get("value_style", "").map(canonical_factor_value_style)
+    factors["label"] = factors.get("label", factors["name"]).astype(str).str.strip()
+
+    if "available" in factors.columns:
+        factors["available"] = (
+            factors["available"].astype(str).str.strip().str.lower().isin({"yes", "y", "true", "1"})
+        )
+    else:
+        factors["available"] = True
+
+    factors = factors[factors["ticker"].astype(str).str.len() > 0].copy()
+    factors = factors.drop_duplicates(subset=["ticker"], keep="first")
+    return factors[["ticker", "name", "region", "size_style", "value_style", "label", "available"]]
 
 
 @st.cache_data(show_spinner=False, ttl=43200)
@@ -4256,6 +4690,94 @@ def build_risk_scatter_chart(risk_df: pd.DataFrame, selected_assets: list[str]) 
     )
 
 
+def select_curve_date_on_or_before(available_dates: list[pd.Timestamp], target_date: pd.Timestamp) -> pd.Timestamp | None:
+    candidates = [pd.Timestamp(date).normalize() for date in available_dates if pd.Timestamp(date).normalize() <= pd.Timestamp(target_date).normalize()]
+    return max(candidates) if candidates else None
+
+
+def build_uk_yield_curve_overlay_options(history_df: pd.DataFrame) -> list[dict[str, object]]:
+    if history_df.empty:
+        return []
+
+    history = history_df.copy()
+    history["curve_date"] = pd.to_datetime(history["curve_date"], errors="coerce").dt.normalize()
+    nominal_dates = set(history.loc[history["curve_type"] == "Nominal", "curve_date"].dropna().drop_duplicates().tolist())
+    real_dates = set(history.loc[history["curve_type"] == "Real", "curve_date"].dropna().drop_duplicates().tolist())
+    common_dates = sorted(pd.Timestamp(date).normalize() for date in nominal_dates.intersection(real_dates))
+    if not common_dates:
+        return []
+
+    latest_common = max(common_dates)
+    target_defs = [
+        ("Last month end", latest_common),
+        ("LME-1", (latest_common.to_period("M") - 1).end_time.normalize()),
+        ("LME-2", (latest_common.to_period("M") - 2).end_time.normalize()),
+        ("LME-3", (latest_common.to_period("M") - 3).end_time.normalize()),
+    ]
+
+    options: list[dict[str, object]] = []
+    for label, target in target_defs:
+        resolved = select_curve_date_on_or_before(common_dates, pd.Timestamp(target))
+        if resolved is None:
+            continue
+        options.append({"label": label, "curve_date": resolved, "key": re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")})
+    return options
+
+
+def build_breakeven_curve_points(curve_df: pd.DataFrame) -> pd.DataFrame:
+    expected = {"maturity_years", "yield_percent", "curve_type", "curve_date", "snapshot_label", "is_current", "snapshot_sort"}
+    if curve_df.empty or not expected.issubset(curve_df.columns):
+        return pd.DataFrame(columns=list(expected))
+
+    out_frames = []
+    for (snapshot_label, is_current, snapshot_sort), group in curve_df.groupby(["snapshot_label", "is_current", "snapshot_sort"], dropna=False):
+        nominal = group[group["curve_type"] == "Nominal"][["maturity_years", "yield_percent", "curve_date"]].copy()
+        real = group[group["curve_type"] == "Real"][["maturity_years", "yield_percent", "curve_date"]].copy()
+        if nominal.empty or real.empty:
+            continue
+
+        nominal = nominal.rename(columns={"yield_percent": "nominal_yield", "curve_date": "nominal_date"})
+        real = real.rename(columns={"yield_percent": "real_yield", "curve_date": "real_date"})
+        nominal_sorted = nominal.sort_values("maturity_years").dropna(subset=["maturity_years", "nominal_yield"])
+        real_sorted = real.sort_values("maturity_years").dropna(subset=["maturity_years", "real_yield"])
+        if nominal_sorted.empty or real_sorted.empty:
+            continue
+
+        interpolated_nominal = np.interp(
+            real_sorted["maturity_years"].to_numpy(),
+            nominal_sorted["maturity_years"].to_numpy(),
+            nominal_sorted["nominal_yield"].to_numpy(),
+        )
+        bei = real_sorted.copy()
+        bei["nominal_yield"] = interpolated_nominal
+        bei["nominal_date"] = nominal_sorted["nominal_date"].max()
+        bei["curve_type"] = "Breakeven inflation"
+        bei["yield_percent"] = (((1 + (bei["nominal_yield"] / 100.0)) / (1 + (bei["real_yield"] / 100.0))) - 1) * 100.0
+        bei["curve_date"] = bei[["nominal_date", "real_date"]].max(axis=1)
+        bei["snapshot_label"] = snapshot_label
+        bei["is_current"] = bool(is_current)
+        bei["snapshot_sort"] = int(snapshot_sort)
+        out_frames.append(
+            bei[["maturity_years", "yield_percent", "curve_type", "curve_date", "snapshot_label", "is_current", "snapshot_sort"]]
+        )
+
+    return pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame(columns=list(expected))
+
+
+def shade_hex_colour(hex_colour: str, blend: float) -> str:
+    text = str(hex_colour).strip()
+    if not text.startswith("#") or len(text) != 7:
+        return text
+    blend = min(max(float(blend), 0.0), 1.0)
+    r = int(text[1:3], 16)
+    g = int(text[3:5], 16)
+    b = int(text[5:7], 16)
+    r = int(round(r + (255 - r) * blend))
+    g = int(round(g + (255 - g) * blend))
+    b = int(round(b + (255 - b) * blend))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
     if yield_curve_df.empty:
         return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
@@ -4263,11 +4785,29 @@ def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
     chart_df = yield_curve_df.copy()
     chart_df["curve_type"] = pd.Categorical(chart_df["curve_type"], categories=["Nominal", "Real", "Breakeven inflation"], ordered=True)
     chart_df["yield_decimal"] = pd.to_numeric(chart_df["yield_percent"], errors="coerce") / 100.0
+    chart_df["snapshot_label"] = chart_df.get("snapshot_label", "Latest").astype(str)
+    chart_df["is_current"] = chart_df.get("is_current", True).astype(bool)
+    chart_df["snapshot_sort"] = pd.to_numeric(chart_df.get("snapshot_sort", 0), errors="coerce").fillna(0).astype(int)
+    chart_df["variant_idx"] = chart_df["snapshot_sort"].clip(lower=0, upper=4)
 
-    return (
-        alt.Chart(chart_df)
-        .mark_line(point=True, strokeWidth=2.8)
-        .encode(
+    base_colour_map = {"Nominal": "#c95b2b", "Real": "#1f77b4", "Breakeven inflation": "#2e8b57"}
+    historical_blends = {1: 0.12, 2: 0.12, 3: 0.38, 4: 0.38}
+    opacity_map = {1: 0.66, 2: 0.66, 3: 0.33, 4: 0.33}
+    stroke_dash_map = {1: [1, 0], 2: [9, 3], 3: [1, 0], 4: [9, 3]}
+    historical_colour_domain = []
+    historical_colour_range = []
+    for variant_idx in [1, 2, 3, 4]:
+        for curve_type in ["Nominal", "Real", "Breakeven inflation"]:
+            historical_colour_domain.append(f"{curve_type}|{variant_idx}")
+            historical_colour_range.append(
+                shade_hex_colour(base_colour_map.get(curve_type, "#666666"), historical_blends.get(variant_idx, 0.35))
+            )
+    chart_df["historical_series"] = chart_df.apply(
+        lambda row: f"{row['curve_type']}|{int(row['variant_idx'])}" if not bool(row["is_current"]) else "",
+        axis=1,
+    )
+
+    base = alt.Chart(chart_df).encode(
             x=alt.X(
                 "maturity_years:Q",
                 title="Maturity (years)",
@@ -4292,9 +4832,24 @@ def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
                     grid=True,
                     gridColor=MID_GREY,
                     gridDash=[2, 4],
-                    format=".0%",
+                    format=".1%",
                 ),
             ),
+            order=alt.Order("snapshot_sort:Q", sort="ascending"),
+            tooltip=[
+                alt.Tooltip("curve_type:N", title="Curve"),
+                alt.Tooltip("snapshot_label:N", title="Snapshot"),
+                alt.Tooltip("curve_date:T", title="Date"),
+                alt.Tooltip("maturity_years:Q", title="Maturity (years)", format=".1f"),
+                alt.Tooltip("yield_decimal:Q", title="Yield", format=".2%"),
+            ],
+        )
+
+    latest = (
+        base.transform_filter(alt.datum.is_current == True)
+        .mark_line(point=True, strokeWidth=2.8, opacity=1.0)
+        .encode(
+            detail=["curve_type:N", "snapshot_label:N"],
             color=alt.Color(
                 "curve_type:N",
                 title=None,
@@ -4304,16 +4859,368 @@ def build_yield_curve_chart(yield_curve_df: pd.DataFrame) -> alt.Chart:
                     orient="bottom",
                     direction="horizontal",
                     columns=3,
+                    symbolLimit=3,
+                ),
+            ),
+        )
+    )
+
+    layers = []
+    for variant_idx in [1, 2, 3, 4]:
+        layers.append(
+            base.transform_filter((alt.datum.is_current == False) & (alt.datum.snapshot_sort == variant_idx))
+            .mark_line(
+                point=False,
+                strokeWidth=2.2,
+                opacity=opacity_map[variant_idx],
+                strokeDash=stroke_dash_map[variant_idx],
+            )
+            .encode(
+                detail=["curve_type:N", "snapshot_label:N"],
+                color=alt.Color(
+                    "historical_series:N",
+                    scale=alt.Scale(domain=historical_colour_domain, range=historical_colour_range),
+                    legend=None,
+                ),
+            )
+        )
+
+    return (
+        alt.layer(*layers, latest)
+        .properties(height=420, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .configure_view(stroke=None, fill=CHART_BG_GREY)
+        .configure_axis(labelFont="Calibri", titleFont="Calibri")
+        .configure_legend(
+            labelFont="Calibri",
+            titleFont="Calibri",
+            fillColor=CHART_BG_GREY,
+            strokeColor=CHART_BG_GREY,
+        )
+        .configure(background=CHART_BG_GREY)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_uk_historical_yield_df(history_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty:
+        return pd.DataFrame(columns=["curve_date", "curve_type", "target_maturity", "selected_maturity", "yield_percent", "series_label"])
+
+    working = history_df.copy()
+    working["curve_date"] = pd.to_datetime(working["curve_date"], errors="coerce").dt.normalize()
+    working["maturity_years"] = pd.to_numeric(working["maturity_years"], errors="coerce")
+    working["yield_percent"] = pd.to_numeric(working["yield_percent"], errors="coerce")
+    working = working.dropna(subset=["curve_date", "curve_type", "maturity_years", "yield_percent"])
+    if working.empty:
+        return pd.DataFrame(columns=["curve_date", "curve_type", "target_maturity", "selected_maturity", "yield_percent", "series_label"])
+
+    def maturity_label(value: float) -> str:
+        number = float(value)
+        if abs(number - round(number)) < 1e-9:
+            return f"{int(round(number))}Y"
+        return f"{number:.1f}Y"
+
+    target_maturities = [1.0, 5.0, 10.0, 30.0]
+    rows = []
+    for (curve_date, curve_type), group in working.groupby(["curve_date", "curve_type"], dropna=False):
+        group = group.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="last")
+        if group.empty:
+            continue
+        min_maturity = float(group["maturity_years"].min())
+        max_maturity = float(group["maturity_years"].max())
+        for target_maturity in target_maturities:
+            if curve_type == "Real" and target_maturity == 1.0:
+                selected = group.iloc[0]
+                label_maturity = float(selected["maturity_years"])
+            else:
+                if target_maturity < min_maturity or target_maturity > max_maturity:
+                    continue
+                distance = (group["maturity_years"] - target_maturity).abs()
+                selected = group.loc[distance.idxmin()]
+                label_maturity = float(target_maturity)
+            rows.append(
+                {
+                    "curve_date": pd.Timestamp(curve_date),
+                    "curve_type": str(curve_type),
+                    "target_maturity": float(target_maturity),
+                    "selected_maturity": float(selected["maturity_years"]),
+                    "yield_percent": float(selected["yield_percent"]),
+                    "series_label": f"{curve_type} {maturity_label(label_maturity)}",
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    bei_rows = []
+    for curve_date, group in out.groupby("curve_date", dropna=False):
+        nominal = group[group["curve_type"] == "Nominal"].copy()
+        real = group[group["curve_type"] == "Real"].copy()
+        if nominal.empty or real.empty:
+            continue
+        nominal = nominal.sort_values("selected_maturity")
+        if nominal.empty:
+            continue
+        for row in real.itertuples():
+            maturity = float(row.selected_maturity)
+            interpolated_nominal = np.interp(
+                maturity,
+                nominal["selected_maturity"].to_numpy(),
+                nominal["yield_percent"].to_numpy(),
+            )
+            bei_rows.append(
+                {
+                    "curve_date": pd.Timestamp(curve_date),
+                    "curve_type": "Breakeven inflation",
+                    "target_maturity": float(row.target_maturity),
+                    "selected_maturity": maturity,
+                    "yield_percent": (((1 + (interpolated_nominal / 100.0)) / (1 + (float(row.yield_percent) / 100.0))) - 1) * 100.0,
+                    "series_label": f"BEI {maturity_label(maturity)}",
+                }
+            )
+
+    if bei_rows:
+        out = pd.concat([out, pd.DataFrame(bei_rows)], ignore_index=True)
+
+    return out.sort_values(["curve_date", "curve_type", "selected_maturity"]).reset_index(drop=True)
+
+
+def get_uk_historical_yield_start_date(period_key: str, end_date: pd.Timestamp, min_start_date: pd.Timestamp) -> pd.Timestamp:
+    if period_key == "MAX":
+        return pd.Timestamp(min_start_date).normalize()
+    return get_chart_period_start_date(period_key, end_date, min_start_date)
+
+
+def build_uk_historical_yield_chart(history_df: pd.DataFrame, selected_series: list[str], period_key: str) -> alt.Chart:
+    if history_df.empty:
+        return alt.Chart(pd.DataFrame({"curve_date": [], "yield_decimal": [], "series_label": []})).mark_line()
+
+    chart_df = history_df.copy()
+    chart_df["curve_date"] = pd.to_datetime(chart_df["curve_date"], errors="coerce")
+    chart_df["yield_decimal"] = pd.to_numeric(chart_df["yield_percent"], errors="coerce") / 100.0
+    chart_df = chart_df.dropna(subset=["curve_date", "yield_decimal", "series_label"])
+    if selected_series:
+        chart_df = chart_df[chart_df["series_label"].isin(selected_series)].copy()
+    if chart_df.empty:
+        return alt.Chart(pd.DataFrame({"curve_date": [], "yield_decimal": [], "series_label": []})).mark_line()
+
+    series_order = [label for label in selected_series if label in chart_df["series_label"].unique()] if selected_series else sorted(chart_df["series_label"].unique())
+    colour_map = {
+        "Nominal 1Y": "#dd865d",
+        "Nominal 5Y": "#c95b2b",
+        "Nominal 10Y": "#a9441c",
+        "Nominal 30Y": "#7f2e0f",
+        "Real 2.5Y": "#7cb7e5",
+        "Real 5Y": "#529ad0",
+        "Real 10Y": "#2f7fbc",
+        "Real 30Y": "#15527b",
+        "BEI 2.5Y": "#82c792",
+        "BEI 5Y": "#58ad6e",
+        "BEI 10Y": "#2e8b57",
+        "BEI 30Y": "#1f6a41",
+    }
+    colour_range = [colour_map.get(label, "#666666") for label in series_order]
+    x_axis_format = get_chart_axis_format(period_key if period_key in CHART_PERIODS else "20Y")
+
+    return (
+        alt.Chart(chart_df)
+        .mark_line(strokeWidth=2.4)
+        .encode(
+            x=alt.X(
+                "curve_date:T",
+                title=None,
+                axis=alt.Axis(
+                    format=x_axis_format,
+                    labelColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y(
+                "yield_decimal:Q",
+                title="Yield",
+                axis=alt.Axis(
+                    format=".1%",
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                ),
+            ),
+            color=alt.Color(
+                "series_label:N",
+                title=None,
+                scale=alt.Scale(domain=series_order, range=colour_range),
+                legend=alt.Legend(
+                    labelColor=TEXT_GREY,
+                    orient="bottom",
+                    direction="horizontal",
+                    columns=max(1, len(series_order)),
+                    labelLimit=180,
                 ),
             ),
             tooltip=[
-                alt.Tooltip("curve_type:N", title="Curve"),
                 alt.Tooltip("curve_date:T", title="Date"),
-                alt.Tooltip("maturity_years:Q", title="Maturity (years)", format=".1f"),
+                alt.Tooltip("series_label:N", title="Series"),
                 alt.Tooltip("yield_decimal:Q", title="Yield", format=".2%"),
+                alt.Tooltip("selected_maturity:Q", title="Source maturity", format=".1f"),
             ],
         )
-        .properties(height=420, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .properties(height=360, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
+        .configure_view(stroke=None, fill=CHART_BG_GREY)
+        .configure_axis(labelFont="Calibri", titleFont="Calibri")
+        .configure_legend(
+            labelFont="Calibri",
+            titleFont="Calibri",
+            fillColor=CHART_BG_GREY,
+            strokeColor=CHART_BG_GREY,
+        )
+        .configure(background=CHART_BG_GREY)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_uk_term_spread_df(history_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty:
+        return pd.DataFrame(columns=["curve_date", "curve_type", "series_label", "spread_percent", "short_maturity", "long_maturity"])
+
+    working = history_df.copy()
+    working["curve_date"] = pd.to_datetime(working["curve_date"], errors="coerce").dt.normalize()
+    working["maturity_years"] = pd.to_numeric(working["maturity_years"], errors="coerce")
+    working["yield_percent"] = pd.to_numeric(working["yield_percent"], errors="coerce")
+    working = working.dropna(subset=["curve_date", "curve_type", "maturity_years", "yield_percent"])
+    if working.empty:
+        return pd.DataFrame(columns=["curve_date", "curve_type", "series_label", "spread_percent", "short_maturity", "long_maturity"])
+
+    spread_defs = [
+        ("Nominal", 30.0, 10.0, "Nominal 30-10Y"),
+        ("Nominal", 10.0, 2.0, "Nominal 10-2Y"),
+        ("Nominal", 5.0, 1.0, "Nominal 5-1Y"),
+        ("Nominal", 10.0, 0.5, "Nominal 10-0.5Y"),
+        ("Nominal", 2.0, 0.5, "Nominal 2-0.5Y"),
+        ("Real", 30.0, 10.0, "Real 30-10Y"),
+        ("Real", 10.0, 2.5, "Real 10-2.5Y"),
+        ("Real", 5.0, 2.5, "Real 5-2.5Y"),
+    ]
+
+    rows = []
+    for (curve_date, curve_type), group in working.groupby(["curve_date", "curve_type"], dropna=False):
+        group = group.sort_values("maturity_years").drop_duplicates(subset=["maturity_years"], keep="last")
+        if group.empty:
+            continue
+        for target_curve_type, long_target, short_target, series_label in spread_defs:
+            if curve_type != target_curve_type:
+                continue
+            long_idx = (group["maturity_years"] - long_target).abs().idxmin()
+            short_idx = (group["maturity_years"] - short_target).abs().idxmin()
+            long_row = group.loc[long_idx]
+            short_row = group.loc[short_idx]
+            if abs(float(long_row["maturity_years"]) - long_target) > 0.26:
+                continue
+            if abs(float(short_row["maturity_years"]) - short_target) > 0.26:
+                continue
+            rows.append(
+                {
+                    "curve_date": pd.Timestamp(curve_date),
+                    "curve_type": str(curve_type),
+                    "series_label": series_label,
+                    "spread_percent": float(long_row["yield_percent"]) - float(short_row["yield_percent"]),
+                    "short_maturity": float(short_row["maturity_years"]),
+                    "long_maturity": float(long_row["maturity_years"]),
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["curve_date", "curve_type", "series_label"]).reset_index(drop=True)
+
+
+def build_uk_term_spread_chart(spread_df: pd.DataFrame, selected_series: list[str], period_key: str) -> alt.Chart:
+    if spread_df.empty:
+        return alt.Chart(pd.DataFrame({"curve_date": [], "spread_decimal": [], "series_label": []})).mark_line()
+
+    chart_df = spread_df.copy()
+    chart_df["curve_date"] = pd.to_datetime(chart_df["curve_date"], errors="coerce")
+    chart_df["spread_decimal"] = pd.to_numeric(chart_df["spread_percent"], errors="coerce") / 100.0
+    chart_df = chart_df.dropna(subset=["curve_date", "spread_decimal", "series_label"])
+    if selected_series:
+        chart_df = chart_df[chart_df["series_label"].isin(selected_series)].copy()
+    if chart_df.empty:
+        return alt.Chart(pd.DataFrame({"curve_date": [], "spread_decimal": [], "series_label": []})).mark_line()
+
+    series_order = [label for label in selected_series if label in chart_df["series_label"].unique()] if selected_series else sorted(chart_df["series_label"].unique())
+    colour_map = {
+        "Nominal 30-10Y": "#e15759",
+        "Nominal 10-2Y": "#f28e2b",
+        "Nominal 5-1Y": "#edc948",
+        "Nominal 10-0.5Y": "#b07aa1",
+        "Nominal 2-0.5Y": "#9c755f",
+        "Real 30-10Y": "#76b7b2",
+        "Real 10-2.5Y": "#4e79a7",
+        "Real 5-2.5Y": "#1f3f75",
+    }
+    colour_range = [colour_map.get(label, "#666666") for label in series_order]
+    x_axis_format = get_chart_axis_format(period_key if period_key in CHART_PERIODS else "20Y")
+
+    return (
+        alt.Chart(chart_df)
+        .mark_line(strokeWidth=2.4)
+        .encode(
+            x=alt.X(
+                "curve_date:T",
+                title=None,
+                axis=alt.Axis(
+                    format=x_axis_format,
+                    labelColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y(
+                "spread_decimal:Q",
+                title="Spread",
+                axis=alt.Axis(
+                    format=".1%",
+                    labelColor=TEXT_GREY,
+                    titleColor=TEXT_GREY,
+                    labelFontSize=15,
+                    tickColor=MID_GREY,
+                    domainColor=MID_GREY,
+                    grid=True,
+                    gridColor=MID_GREY,
+                    gridDash=[2, 4],
+                ),
+            ),
+            color=alt.Color(
+                "series_label:N",
+                title=None,
+                scale=alt.Scale(domain=series_order, range=colour_range),
+                legend=alt.Legend(
+                    labelColor=TEXT_GREY,
+                    orient="bottom",
+                    direction="horizontal",
+                    columns=max(1, len(series_order)),
+                    labelLimit=180,
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("curve_date:T", title="Date"),
+                alt.Tooltip("series_label:N", title="Spread"),
+                alt.Tooltip("spread_decimal:Q", title="Spread", format=".2%"),
+                alt.Tooltip("long_maturity:Q", title="Long maturity", format=".1f"),
+                alt.Tooltip("short_maturity:Q", title="Short maturity", format=".1f"),
+            ],
+        )
+        .properties(height=340, width="container", padding={"left": 14, "top": 8, "right": 28, "bottom": 10})
         .configure_view(stroke=None, fill=CHART_BG_GREY)
         .configure_axis(labelFont="Calibri", titleFont="Calibri")
         .configure_legend(
@@ -4358,7 +5265,7 @@ def build_global_yield_curve_chart(global_yield_curve_df: pd.DataFrame) -> alt.C
                 "yield_decimal:Q",
                 title="Yield",
                 axis=alt.Axis(
-                    format=".0%",
+                    format=".1%",
                     labelColor=TEXT_GREY,
                     titleColor=TEXT_GREY,
                     labelFontSize=15,
@@ -4379,6 +5286,7 @@ def build_global_yield_curve_chart(global_yield_curve_df: pd.DataFrame) -> alt.C
                     columns=legend_columns,
                     labelLimit=200,
                     symbolType="stroke",
+                    symbolLimit=legend_columns,
                 ),
             ),
             tooltip=[
@@ -4400,40 +5308,43 @@ def build_global_yield_curve_chart(global_yield_curve_df: pd.DataFrame) -> alt.C
     )
 
 
-def build_yield_curve_display_df(yield_curve_df: pd.DataFrame, selected_series: list[str]) -> pd.DataFrame:
-    if yield_curve_df.empty:
-        return pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"])
+def build_yield_curve_display_df(
+    yield_curve_df: pd.DataFrame,
+    selected_series: list[str],
+    historical_curve_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    empty_cols = ["maturity_years", "yield_percent", "curve_type", "curve_date", "snapshot_label", "is_current", "snapshot_sort"]
+    if yield_curve_df.empty and (historical_curve_df is None or historical_curve_df.empty):
+        return pd.DataFrame(columns=empty_cols)
 
-    base = yield_curve_df.copy()
-    if selected_series:
-        base = base[base["curve_type"].isin(selected_series)].copy()
+    frames = []
+    if not yield_curve_df.empty:
+        latest = yield_curve_df.copy()
+        latest["snapshot_label"] = "Latest"
+        latest["is_current"] = True
+        latest["snapshot_sort"] = 0
+        frames.append(latest)
+    if historical_curve_df is not None and not historical_curve_df.empty:
+        historical = historical_curve_df.copy()
+        historical["snapshot_label"] = historical["snapshot_label"].astype(str)
+        historical["is_current"] = False
+        historical["snapshot_sort"] = pd.to_numeric(historical["snapshot_sort"], errors="coerce").fillna(1).astype(int)
+        frames.append(historical)
 
-    nominal = yield_curve_df[yield_curve_df["curve_type"] == "Nominal"][["maturity_years", "yield_percent", "curve_date"]].copy()
-    real = yield_curve_df[yield_curve_df["curve_type"] == "Real"][["maturity_years", "yield_percent", "curve_date"]].copy()
-    nominal = nominal.rename(columns={"yield_percent": "nominal_yield", "curve_date": "nominal_date"})
-    real = real.rename(columns={"yield_percent": "real_yield", "curve_date": "real_date"})
-    if not nominal.empty and not real.empty:
-        nominal_sorted = nominal.sort_values("maturity_years").dropna(subset=["maturity_years", "nominal_yield"])
-        real_sorted = real.sort_values("maturity_years").dropna(subset=["maturity_years", "real_yield"])
-        interpolated_nominal = np.interp(
-            real_sorted["maturity_years"].to_numpy(),
-            nominal_sorted["maturity_years"].to_numpy(),
-            nominal_sorted["nominal_yield"].to_numpy(),
-        )
-        bei = real_sorted.copy()
-        bei["nominal_yield"] = interpolated_nominal
-        bei["nominal_date"] = nominal_sorted["nominal_date"].max()
-        bei["curve_type"] = "Breakeven inflation"
-        bei["yield_percent"] = (((1 + (bei["nominal_yield"] / 100.0)) / (1 + (bei["real_yield"] / 100.0))) - 1) * 100.0
-        bei["curve_date"] = bei[["nominal_date", "real_date"]].max(axis=1)
-        bei = bei[["maturity_years", "yield_percent", "curve_type", "curve_date"]]
-    else:
-        bei = pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date"])
+    base = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=empty_cols)
+    if base.empty:
+        return pd.DataFrame(columns=empty_cols)
 
+    base["curve_date"] = pd.to_datetime(base["curve_date"], errors="coerce")
+    base = base.dropna(subset=["maturity_years", "yield_percent", "curve_type", "curve_date"])
+    if base.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    bei = build_breakeven_curve_points(base)
     combined = pd.concat([base, bei], ignore_index=True)
     if selected_series:
         combined = combined[combined["curve_type"].isin(selected_series)].copy()
-    return combined.sort_values(["curve_type", "maturity_years"]).reset_index(drop=True)
+    return combined.sort_values(["snapshot_sort", "curve_type", "maturity_years"]).reset_index(drop=True)
 
 
 def ppt_rgb(hex_color: str) -> RGBColor:
@@ -5144,15 +6055,6 @@ st.markdown(
         display: block;
     }}
 
-    .toolbar-title {{
-        font-size: 13px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: #444;
-        margin-bottom: 4px;
-    }}
-
     .toolbar-label {{
         font-size: 13px;
         font-weight: 700;
@@ -5171,63 +6073,10 @@ st.markdown(
         white-space: nowrap;
     }}
 
-    .st-key-market_snapshot_toolbar,
-    .st-key-performance_analysis_toolbar {{
-        border: 0.8px solid {MID_GREY} !important;
-        border-radius: 10px !important;
-        background: #ffffff !important;
-        padding: 10px 12px 8px 12px !important;
-        margin-bottom: 10px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar .toolbar-title,
-    .st-key-performance_analysis_toolbar .toolbar-title {{
-        margin-bottom: 6px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar .toolbar-label,
-    .st-key-market_snapshot_toolbar .toolbar-label-muted,
-    .st-key-performance_analysis_toolbar .toolbar-label,
-    .st-key-performance_analysis_toolbar .toolbar-label-muted {{
-        color: #444 !important;
-        margin-bottom: 5px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar [data-testid="stSegmentedControl"],
-    .st-key-performance_analysis_toolbar [data-testid="stSegmentedControl"] {{
-        min-height: 40px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar [data-testid="stSegmentedControl"] button,
-    .st-key-performance_analysis_toolbar [data-testid="stSegmentedControl"] button {{
-        min-height: 40px !important;
-        padding: 0 11px !important;
-        font-size: 13px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] > div,
-    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] > div {{
-        min-height: 40px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] [data-baseweb="input"],
-    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] [data-baseweb="input"] {{
-        min-height: 40px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar div[data-testid="stDateInput"] input,
-    .st-key-performance_analysis_toolbar div[data-testid="stDateInput"] input {{
-        min-height: 40px !important;
-        padding-top: 0 !important;
-        padding-bottom: 0 !important;
-        font-size: 11.5px !important;
-    }}
-
-    .st-key-market_snapshot_toolbar .stDownloadButton button,
-    .st-key-performance_analysis_toolbar .stDownloadButton button {{
-        min-height: 40px !important;
-        width: 100% !important;
-        font-size: 13px !important;
+    div[data-testid="stCheckbox"] label,
+    div[data-testid="stCheckbox"] label p,
+    div[data-testid="stCheckbox"] span {{
+        color: #333 !important;
     }}
 
     .snapshot-toolbar-note {{
@@ -5235,6 +6084,61 @@ st.markdown(
         color: {TEXT_GREY};
         margin: 0 0 14px 0;
         line-height: 1.25;
+    }}
+
+    .factor-style-shell {{
+        width: 100%;
+        border: 0.2px solid {MID_GREY};
+        border-radius: 12px;
+        padding: 12px;
+        margin-bottom: 10px;
+        background: {WHITE};
+        box-sizing: border-box;
+    }}
+
+    .factor-style-grid {{
+        display: grid;
+        grid-template-columns: minmax(92px, 0.95fr) repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        align-items: stretch;
+    }}
+
+    .factor-style-header {{
+        font-size: 15px;
+        font-weight: 700;
+        color: {TEXT_GREY};
+        padding: 4px 2px 8px 2px;
+        text-align: center;
+    }}
+
+    .factor-style-corner {{
+        text-align: left;
+    }}
+
+    .factor-style-row-label {{
+        display: flex;
+        align-items: center;
+        font-size: 15px;
+        font-weight: 700;
+        color: {TEXT_GREY};
+        padding: 0 4px;
+    }}
+
+    .factor-style-cell {{
+        min-height: 72px;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1;
+        box-sizing: border-box;
+    }}
+
+    .factor-style-cell-empty {{
+        background: {LIGHT_GREY};
+        color: #9a9a9a;
     }}
 
     .country-card-grid {{
@@ -5337,10 +6241,18 @@ st.markdown(
         padding-bottom: 3px;
     }}
 
+    .patchwork-metric-header {{
+        min-width: 100px;
+    }}
+
     .patchwork-year-col {{
         display: flex;
         flex-direction: column;
         gap: 6px;
+    }}
+
+    .patchwork-metric-col {{
+        min-width: 100px;
     }}
 
     .patchwork-cell {{
@@ -5366,42 +6278,8 @@ st.markdown(
         line-height: 1.0;
     }}
 
-    .patchwork-legend-title {{
-        font-size: 16px;
-        font-weight: 800;
-        color: #444;
-        margin-bottom: 8px;
-    }}
-
-    .patchwork-legend {{
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        gap: 6px 12px;
-    }}
-
-    .patchwork-legend-item {{
-        display: grid;
-        grid-template-columns: 12px 1fr auto;
-        gap: 8px;
-        align-items: center;
-        font-size: 14px;
-        color: #333;
-    }}
-
-    .patchwork-legend-swatch {{
-        width: 12px;
-        height: 12px;
-        border-radius: 3px;
-        display: inline-block;
-    }}
-
-    .patchwork-legend-country {{
-        font-weight: 700;
-    }}
-
-    .patchwork-legend-return {{
-        font-weight: 700;
-        white-space: nowrap;
+    .patchwork-summary-cell {{
+        min-height: 52px;
     }}
 
     .period-shell {{
@@ -5802,6 +6680,7 @@ except Exception as exc:
 
 regions_df = load_regions_data(str(DATA_FILE), current_file_mtime)
 sectors_df = load_sectors_data(str(DATA_FILE), current_file_mtime)
+factors_df = load_factors_data(str(DATA_FILE), current_file_mtime)
 
 monthly_levels = build_monthly_index_levels(ts, mapping)
 if not monthly_levels:
@@ -5872,6 +6751,10 @@ yield_curve_df, boe_yield_summary, boe_yield_preview = build_boe_yield_curve_dia
     BOE_YIELD_CURVE_ZIP_URL,
     DIVIDENDDATA_INDEX_LINKED_GILTS_URL,
 )
+yield_curve_history_df, boe_month_end_yield_summary, boe_month_end_yield_preview = build_boe_month_end_yield_curve_history(
+    BOE_NOMINAL_MONTH_END_ZIP_URL,
+    BOE_REAL_MONTH_END_ZIP_URL,
+)
 global_yield_curve_df = pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "curve_date", "source_url"])
 global_yield_summary = pd.DataFrame(columns=["metric", "value"])
 global_yield_preview = pd.DataFrame(columns=["country", "maturity_label", "maturity_years", "yield_percent", "source_url"])
@@ -5922,6 +6805,14 @@ with st.sidebar:
         type="primary" if st.session_state["top_page_selector"] == "Risk" else "secondary",
     ):
         st.session_state["top_page_selector"] = "Risk"
+        st.rerun()
+    if st.button(
+        PAGE_LABELS["Factors"],
+        key="sidebar_page_factors_btn",
+        use_container_width=True,
+        type="primary" if st.session_state["top_page_selector"] == "Factors" else "secondary",
+    ):
+        st.session_state["top_page_selector"] = "Factors"
         st.rerun()
     if st.button(
         PAGE_LABELS["Geo"],
@@ -5987,69 +6878,69 @@ if page_name == "Dashboard":
     )
     dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
-    with st.container(key="market_snapshot_toolbar"):
-        st.markdown('<div class="snapshot-toolbar-anchor"></div><div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([4.15, 2.45])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([0.91, 0.91, 0.91, 0.60, 0.44])
+    toolbar_wrap_cols = st.columns([4.15, 2.45])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([0.91, 0.91, 0.91, 0.60])
 
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Display mode:</div>', unsafe_allow_html=True)
-                display_mode = st.segmented_control(
-                    label="Display mode",
-                    options=["Absolute", "Relative"],
-                    default=st.session_state.get("display_mode_toolbar", "Absolute"),
-                    key="display_mode_toolbar",
-                    label_visibility="collapsed",
-                ) or "Absolute"
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Display mode:</div>', unsafe_allow_html=True)
+            display_mode = st.segmented_control(
+                label="Display mode",
+                options=["Absolute", "Relative"],
+                default=st.session_state.get("display_mode_toolbar", "Absolute"),
+                key="display_mode_toolbar",
+                label_visibility="collapsed",
+            ) or "Absolute"
 
-            is_relative_mode = display_mode == "Relative"
+        is_relative_mode = display_mode == "Relative"
 
-            with toolbar_cols[1]:
-                st.markdown('<div class="toolbar-label">Relative basis:</div>', unsafe_allow_html=True)
-                relative_detail_mode = st.segmented_control(
-                    label="Relative basis",
-                    options=["Major", "Minor"],
-                    default=st.session_state.get("relative_basis_toolbar", "Major"),
-                    key="relative_basis_toolbar",
-                    label_visibility="collapsed",
-                ) or "Major"
+        with toolbar_cols[1]:
+            st.markdown('<div class="toolbar-label">Relative basis:</div>', unsafe_allow_html=True)
+            relative_detail_mode = st.segmented_control(
+                label="Relative basis",
+                options=["Major", "Minor"],
+                default=st.session_state.get("relative_basis_toolbar", "Major"),
+                key="relative_basis_toolbar",
+                label_visibility="collapsed",
+            ) or "Major"
 
-            with toolbar_cols[2]:
-                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
-                return_basis = st.segmented_control(
-                    label="Return basis",
-                    options=["Nominal", "Real"],
-                    default=st.session_state.get("return_basis_toolbar", "Nominal"),
-                    key="return_basis_toolbar",
-                    label_visibility="collapsed",
-                ) or "Nominal"
+        with toolbar_cols[2]:
+            st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+            return_basis = st.segmented_control(
+                label="Return basis",
+                options=["Nominal", "Real"],
+                default=st.session_state.get("return_basis_toolbar", "Nominal"),
+                key="return_basis_toolbar",
+                label_visibility="collapsed",
+            ) or "Nominal"
 
-            is_real_mode = return_basis == "Real"
-            effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
-            end_date_dashboard = get_dashboard_end_date(
-                stitched_series_map=stitched_series_map,
-                live_diag=live_diag,
-                inflation_levels=inflation_levels,
-                is_real_mode=effective_real_mode,
+        is_real_mode = return_basis == "Real"
+        effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+        end_date_dashboard = get_dashboard_end_date(
+            stitched_series_map=stitched_series_map,
+            live_diag=live_diag,
+            inflation_levels=inflation_levels,
+            is_real_mode=effective_real_mode,
+        )
+        dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
+
+        with toolbar_cols[3]:
+            st.markdown('<div class="toolbar-label">End date:</div>', unsafe_allow_html=True)
+            dashboard_end_input = st.date_input(
+                "End date",
+                value=dashboard_saved_end.date(),
+                min_value=whole_period_start.date(),
+                max_value=end_date_dashboard.date(),
+                key="dashboard_end_date_filter",
+                label_visibility="collapsed",
+                format="DD/MM/YYYY",
             )
-            dashboard_saved_end = min(dashboard_saved_end, end_date_dashboard)
 
-            with toolbar_cols[3]:
-                st.markdown('<div class="toolbar-label">End date:</div>', unsafe_allow_html=True)
-                dashboard_end_input = st.date_input(
-                    "End date",
-                    value=dashboard_saved_end.date(),
-                    min_value=whole_period_start.date(),
-                    max_value=end_date_dashboard.date(),
-                    key="dashboard_end_date_filter",
-                    label_visibility="collapsed",
-                    format="DD/MM/YYYY",
-                )
-
-            with toolbar_cols[4]:
-                st.markdown('<div class="toolbar-label">Report builder:</div>', unsafe_allow_html=True)
-                export_report_placeholder = st.empty()
+    with toolbar_wrap_cols[1]:
+        right_cols = st.columns([4.0, 1.0])
+        with right_cols[1]:
+            st.markdown('<div class="toolbar-label">Report builder:</div>', unsafe_allow_html=True)
+            export_report_placeholder = st.empty()
 
     dashboard_end_date_selected = pd.Timestamp(dashboard_end_input)
     dashboard_series_window = filter_series_map_to_window(
@@ -6186,6 +7077,7 @@ if page_name == "Dashboard":
         file_name=f"quarterly_market_metrics_{dashboard_end_date_selected.strftime('%Y_%m')}.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         key="export_quarterly_market_metrics_report",
+        use_container_width=True,
     )
 
     st.markdown(
@@ -6371,21 +7263,19 @@ elif page_name == "Charts":
     charts_saved_end = max(charts_saved_start, min(charts_saved_end, end_date_charts))
     chart_period_options = list(CHART_PERIODS.keys()) + ["Custom"]
 
-    with st.container(key="performance_analysis_toolbar"):
-        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([5.35, 1.25])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([0.92, 1.95, 0.66, 0.66])
+    toolbar_wrap_cols = st.columns([5.35, 1.25])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([0.92, 1.95, 0.66, 0.66])
 
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
-                detail_return_basis = st.segmented_control(
-                    label="Return basis",
-                    options=["Nominal", "Real"],
-                    default=st.session_state.get("detail_return_basis_toolbar", "Nominal"),
-                    key="detail_return_basis_toolbar",
-                    label_visibility="collapsed",
-                ) or "Nominal"
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+            detail_return_basis = st.segmented_control(
+                label="Return basis",
+                options=["Nominal", "Real"],
+                default=st.session_state.get("detail_return_basis_toolbar", "Nominal"),
+                key="detail_return_basis_toolbar",
+                label_visibility="collapsed",
+            ) or "Nominal"
 
     is_real_mode = detail_return_basis == "Real"
     effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
@@ -6439,7 +7329,6 @@ elif page_name == "Charts":
         st.markdown('<div class="toolbar-label">Start date:</div>', unsafe_allow_html=True)
         charts_start_input = st.date_input(
             "Start date",
-            value=charts_active_start.date(),
             min_value=charts_default_start.date(),
             max_value=end_date_charts.date(),
             key="charts_start_date_filter",
@@ -6454,7 +7343,6 @@ elif page_name == "Charts":
         st.markdown('<div class="toolbar-label">End date:</div>', unsafe_allow_html=True)
         charts_end_input = st.date_input(
             "End date",
-            value=charts_active_end.date(),
             min_value=charts_start_date.date(),
             max_value=end_date_charts.date(),
             key="charts_end_date_filter",
@@ -6616,34 +7504,32 @@ elif page_name == "Risk":
         is_real_mode=effective_real_mode,
     )
 
-    with st.container(key="performance_analysis_toolbar"):
-        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([4.9, 1.7])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([0.92, 2.55])
+    toolbar_wrap_cols = st.columns([4.9, 1.7])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([0.92, 2.55])
 
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
-                risk_return_basis = st.segmented_control(
-                    label="Return basis",
-                    options=["Nominal", "Real"],
-                    default=st.session_state.get("risk_return_basis_toolbar", "Nominal"),
-                    key="risk_return_basis_toolbar",
-                    label_visibility="collapsed",
-                ) or "Nominal"
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Return basis:</div>', unsafe_allow_html=True)
+            risk_return_basis = st.segmented_control(
+                label="Return basis",
+                options=["Nominal", "Real"],
+                default=st.session_state.get("risk_return_basis_toolbar", "Nominal"),
+                key="risk_return_basis_toolbar",
+                label_visibility="collapsed",
+            ) or "Nominal"
 
-            is_real_mode = risk_return_basis == "Real"
-            effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
+        is_real_mode = risk_return_basis == "Real"
+        effective_real_mode = is_real_mode and inflation_levels is not None and not inflation_levels.dropna().empty
 
-            with toolbar_cols[1]:
-                st.markdown('<div class="toolbar-label">Risk period:</div>', unsafe_allow_html=True)
-                risk_period = st.segmented_control(
-                    label="Risk period",
-                    options=list(RISK_PERIODS.keys()),
-                    default=st.session_state.get("risk_period_toolbar", "10Y"),
-                    key="risk_period_toolbar",
-                    label_visibility="collapsed",
-                ) or "10Y"
+        with toolbar_cols[1]:
+            st.markdown('<div class="toolbar-label">Risk period:</div>', unsafe_allow_html=True)
+            risk_period = st.segmented_control(
+                label="Risk period",
+                options=list(RISK_PERIODS.keys()),
+                default=st.session_state.get("risk_period_toolbar", "10Y"),
+                key="risk_period_toolbar",
+                label_visibility="collapsed",
+            ) or "10Y"
 
     st.markdown(
         f"""
@@ -6791,6 +7677,77 @@ elif page_name == "Risk":
     )
     st.markdown(f'<div class="methodology-text">{risk_methodology}</div>', unsafe_allow_html=True)
 
+elif page_name == "Factors":
+    factors_period = st.session_state.get("factors_period_toolbar", "YTD")
+    factors_currency = st.session_state.get("factors_currency_toolbar", "USD")
+    fx_values_df = fetch_fx_value_series()
+    _, factor_fx_end_date = build_currency_performance_matrix(fx_values_df, factors_period)
+    factor_period_options = get_geo_period_options(factor_fx_end_date, fx_values_df, factors_currency)
+    if factors_period not in factor_period_options:
+        factors_period = "MAX" if "MAX" in factor_period_options else factor_period_options[0]
+        st.session_state["factors_period_toolbar"] = factors_period
+
+    toolbar_wrap_cols = st.columns([4.9, 1.5])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([1.38, 0.28, 1.14])
+
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+            factors_period = st.segmented_control(
+                label="Period",
+                options=factor_period_options,
+                default=st.session_state.get("factors_period_toolbar", factors_period),
+                key="factors_period_toolbar",
+                label_visibility="collapsed",
+            ) or "YTD"
+
+        with toolbar_cols[1]:
+            st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
+            factors_currency = st.selectbox(
+                "Currency",
+                options=GEO_NEUTRAL_CURRENCIES,
+                index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("factors_currency_toolbar", "USD")),
+                key="factors_currency_toolbar",
+                label_visibility="collapsed",
+            )
+
+    factor_style_box_df, factor_start_anchor, factor_end_date, factor_common_inception = build_factor_style_box_df(
+        factors_df=factors_df,
+        fx_values_df=fx_values_df,
+        period_key=factors_period,
+        neutral_currency=factors_currency,
+        region_key="US",
+    )
+
+    st.markdown('<div class="page-section-title">US equity style box</div>', unsafe_allow_html=True)
+    factor_start_text = pd.Timestamp(factor_start_anchor).strftime("%d/%m/%Y") if factor_start_anchor is not None else "-"
+    factor_end_text = pd.Timestamp(factor_end_date).strftime("%d/%m/%Y") if factor_end_date is not None else "-"
+    common_inception_text = (
+        pd.Timestamp(factor_common_inception).strftime("%d/%m/%Y") if factor_common_inception is not None else "-"
+    )
+    st.markdown(
+        f"""
+        <div class="snapshot-toolbar-note">
+            US size and style factor returns in {factors_currency} from <b>{factor_start_text}</b> to <b>{factor_end_text}</b>. The <b>MAX</b> option uses the common inception across the included US funds, currently <b>{common_inception_text}</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if factor_style_box_df.empty:
+        st.info("No US factor data were available from the factors sheet tickers for the selected period.")
+    else:
+        style_box_cols = st.columns([0.9, 1.2, 0.9])
+        with style_box_cols[1]:
+            st.markdown(build_factor_style_box_html(factor_style_box_df), unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="methodology-text">This tab uses the workbook <b>factors</b> sheet and currently filters it to <b>Region = US</b>. '
+        'Each tile shows the selected-period return for the mapped ETF or fund in that size/style bucket, converted into the chosen currency where quote-currency data are available. '
+        'Tile colours are relative within the 3x3 box, so stronger buckets are greener and weaker buckets are redder.</div>',
+        unsafe_allow_html=True,
+    )
+
 elif page_name == "Geo":
     geo_period = st.session_state.get("geo_period_toolbar", "YTD")
     geo_neutral_currency = st.session_state.get("geo_neutral_currency_toolbar", "USD")
@@ -6826,31 +7783,29 @@ elif page_name == "Geo":
         preferred_series_map=chart_series_map,
     )
 
-    with st.container(key="performance_analysis_toolbar"):
-        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([4.9, 1.5])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([1.38, 0.28, 1.14])
+    toolbar_wrap_cols = st.columns([4.9, 1.5])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([1.38, 0.28, 1.14])
 
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
-                geo_period = st.segmented_control(
-                    label="Period",
-                    options=geo_period_options,
-                    default=st.session_state.get("geo_period_toolbar", geo_period),
-                    key="geo_period_toolbar",
-                    label_visibility="collapsed",
-                ) or "YTD"
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+            geo_period = st.segmented_control(
+                label="Period",
+                options=geo_period_options,
+                default=st.session_state.get("geo_period_toolbar", geo_period),
+                key="geo_period_toolbar",
+                label_visibility="collapsed",
+            ) or "YTD"
 
-            with toolbar_cols[1]:
-                st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
-                geo_neutral_currency = st.selectbox(
-                    "Currency",
-                    options=GEO_NEUTRAL_CURRENCIES,
-                    index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("geo_neutral_currency_toolbar", "USD")),
-                    key="geo_neutral_currency_toolbar",
-                    label_visibility="collapsed",
-                )
+        with toolbar_cols[1]:
+            st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
+            geo_neutral_currency = st.selectbox(
+                "Currency",
+                options=GEO_NEUTRAL_CURRENCIES,
+                index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("geo_neutral_currency_toolbar", "USD")),
+                key="geo_neutral_currency_toolbar",
+                label_visibility="collapsed",
+            )
 
     if geo_period != st.session_state.get("geo_period_toolbar", "YTD"):
         st.session_state["geo_period_toolbar"] = geo_period
@@ -6952,10 +7907,11 @@ elif page_name == "Geo":
     )
     patchwork_start_text = f"31/12/{patchwork_years[0]-1}" if patchwork_years else "-"
     patchwork_end_text = f"31/12/{patchwork_years[-1]}" if patchwork_years else "-"
+    patchwork_latest_text = pd.Timestamp(patchwork_end_date).strftime("%d/%m/%Y") if patchwork_end_date is not None else "-"
     st.markdown(
         f"""
         <div class="snapshot-toolbar-note">
-            Calendar-year {'regional' if patchwork_view == 'Regional' else 'country'} rankings in {geo_neutral_currency} from <b>{patchwork_start_text}</b> to <b>{patchwork_end_text}</b>. Only entries with a full 10-year calendar history are included.
+            Calendar-year {'regional' if patchwork_view == 'Regional' else 'country'} rankings in {geo_neutral_currency} from <b>{patchwork_start_text}</b> to <b>{patchwork_end_text}</b>. The <b>Whole period</b> column shows annualised returns across that full window, and the <b>YTD</b> column runs from <b>31/12/{pd.Timestamp(patchwork_end_date).year - 1 if patchwork_end_date is not None else '-'}</b> to <b>{patchwork_latest_text}</b>. Only entries with a full 10-year calendar history are included.
         </div>
         """,
         unsafe_allow_html=True,
@@ -6987,14 +7943,6 @@ elif page_name == "Sector":
         sector_period = "MAX" if "MAX" in sector_period_options else sector_period_options[0]
         st.session_state["sector_period_toolbar"] = sector_period
 
-    sector_performance_df, sector_end_date = build_labelled_performance_df(
-        source_df=sectors_df,
-        label_col="sector",
-        fx_values_df=fx_values_df,
-        period_key=sector_period,
-        neutral_currency=sector_neutral_currency,
-        preferred_series_map=chart_series_map,
-    )
     sector_series_map, sector_series_end_date = build_labelled_series_map(
         source_df=sectors_df,
         label_col="sector",
@@ -7002,32 +7950,8 @@ elif page_name == "Sector":
         neutral_currency=sector_neutral_currency,
         preferred_series_map=chart_series_map,
     )
-
-    with st.container(key="performance_analysis_toolbar"):
-        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([4.9, 1.5])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([1.38, 0.28, 1.14])
-
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
-                sector_period = st.segmented_control(
-                    label="Period",
-                    options=sector_period_options,
-                    default=st.session_state.get("sector_period_toolbar", sector_period),
-                    key="sector_period_toolbar",
-                    label_visibility="collapsed",
-                ) or "YTD"
-
-            with toolbar_cols[1]:
-                st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
-                sector_neutral_currency = st.selectbox(
-                    "Currency",
-                    options=GEO_NEUTRAL_CURRENCIES,
-                    index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("sector_neutral_currency_toolbar", "USD")),
-                    key="sector_neutral_currency_toolbar",
-                    label_visibility="collapsed",
-                )
+    sector_labels = {str(label).strip() for label in sectors_df["sector"].astype(str).tolist()} if not sectors_df.empty else set()
+    sector_max_start_anchor = get_common_series_inception_anchor(sector_series_map, include_labels=sector_labels)
 
     sector_performance_df, sector_end_date = build_labelled_performance_df(
         source_df=sectors_df,
@@ -7036,18 +7960,59 @@ elif page_name == "Sector":
         period_key=sector_period,
         neutral_currency=sector_neutral_currency,
         preferred_series_map=chart_series_map,
+        max_start_anchor=sector_max_start_anchor,
     )
+
+    toolbar_wrap_cols = st.columns([4.9, 1.5])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([1.38, 0.28, 1.14])
+
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+            sector_period = st.segmented_control(
+                label="Period",
+                options=sector_period_options,
+                default=st.session_state.get("sector_period_toolbar", sector_period),
+                key="sector_period_toolbar",
+                label_visibility="collapsed",
+            ) or "YTD"
+
+        with toolbar_cols[1]:
+            st.markdown('<div class="toolbar-label">Currency:</div>', unsafe_allow_html=True)
+            sector_neutral_currency = st.selectbox(
+                "Currency",
+                options=GEO_NEUTRAL_CURRENCIES,
+                index=GEO_NEUTRAL_CURRENCIES.index(st.session_state.get("sector_neutral_currency_toolbar", "USD")),
+                key="sector_neutral_currency_toolbar",
+                label_visibility="collapsed",
+            )
+
     sector_series_map, sector_series_end_date = build_labelled_series_map(
         source_df=sectors_df,
         label_col="sector",
         fx_values_df=fx_values_df,
         neutral_currency=sector_neutral_currency,
         preferred_series_map=chart_series_map,
+    )
+    sector_labels = {str(label).strip() for label in sectors_df["sector"].astype(str).tolist()} if not sectors_df.empty else set()
+    sector_max_start_anchor = get_common_series_inception_anchor(sector_series_map, include_labels=sector_labels)
+    sector_performance_df, sector_end_date = build_labelled_performance_df(
+        source_df=sectors_df,
+        label_col="sector",
+        fx_values_df=fx_values_df,
+        period_key=sector_period,
+        neutral_currency=sector_neutral_currency,
+        preferred_series_map=chart_series_map,
+        max_start_anchor=sector_max_start_anchor,
     )
 
     st.markdown('<div class="page-section-title">Sector performance</div>', unsafe_allow_html=True)
     sector_start_text = (
-        get_geo_period_start_anchor(sector_end_date, sector_period, fx_values_df, sector_neutral_currency).strftime("%d/%m/%Y")
+        (
+            pd.Timestamp(sector_max_start_anchor).strftime("%d/%m/%Y")
+            if sector_period == "MAX" and sector_max_start_anchor is not None
+            else get_geo_period_start_anchor(sector_end_date, sector_period, fx_values_df, sector_neutral_currency).strftime("%d/%m/%Y")
+        )
         if sector_end_date is not None
         else "-"
     )
@@ -7073,10 +8038,11 @@ elif page_name == "Sector":
     )
     sector_patchwork_start_text = f"31/12/{sector_patchwork_years[0]-1}" if sector_patchwork_years else "-"
     sector_patchwork_end_text = f"31/12/{sector_patchwork_years[-1]}" if sector_patchwork_years else "-"
+    sector_patchwork_latest_text = pd.Timestamp(sector_end_date).strftime("%d/%m/%Y") if sector_end_date is not None else "-"
     st.markdown(
         f"""
         <div class="snapshot-toolbar-note">
-            Calendar-year sector rankings in {sector_neutral_currency} from <b>{sector_patchwork_start_text}</b> to <b>{sector_patchwork_end_text}</b>. Only sectors with a full 10-year calendar history are included.
+            Calendar-year sector rankings in {sector_neutral_currency} from <b>{sector_patchwork_start_text}</b> to <b>{sector_patchwork_end_text}</b>. The <b>Whole period</b> column shows annualised returns across that full window, and the <b>YTD</b> column runs from <b>31/12/{pd.Timestamp(sector_end_date).year - 1 if sector_end_date is not None else '-'}</b> to <b>{sector_patchwork_latest_text}</b>. Only sectors with a full 10-year calendar history are included.
         </div>
         """,
         unsafe_allow_html=True,
@@ -7089,7 +8055,7 @@ elif page_name == "Sector":
     st.markdown(
         '<div class="methodology-text">This tab shows sector performance using the tickers on the workbook <b>sectors</b> sheet where <b>Available = Yes</b>. '
         'Yahoo Finance prices are converted into the selected neutral currency where quote-currency data are available. '
-        f'The <b>MAX</b> option uses a fixed start date anchored to <b>{GEO_MAX_START.strftime("%d/%m/%Y")}</b> or the selected FX history where later. '
+        f'The <b>MAX</b> option uses the common inception date across the available sector ETFs, currently <b>{pd.Timestamp(sector_max_start_anchor).strftime("%d/%m/%Y") if sector_max_start_anchor is not None else "-"}</b>. '
         'The patchwork quilt ranks each included sector by calendar-year return, top to bottom within each year, and shows only sectors with a full 10-year history across the displayed quilt window.</div>',
         unsafe_allow_html=True,
     )
@@ -7111,24 +8077,67 @@ else:
         and "Fetch status" in boe_yield_summary["metric"].values
         and boe_yield_summary.loc[boe_yield_summary["metric"] == "Fetch status", "value"].astype(str).iloc[0] == "OK"
     )
-    yield_curve_display_df = build_yield_curve_display_df(yield_curve_df, selected_yield_series)
+    boe_month_end_fetch_ok = (
+        not boe_month_end_yield_summary.empty
+        and "Fetch status" in boe_month_end_yield_summary["metric"].values
+        and boe_month_end_yield_summary.loc[boe_month_end_yield_summary["metric"] == "Fetch status", "value"].astype(str).iloc[0] == "OK"
+    )
+    overlay_options = build_uk_yield_curve_overlay_options(yield_curve_history_df) if boe_month_end_fetch_ok else []
+    selected_overlay_defs: list[dict[str, object]] = []
+    if overlay_options:
+        st.markdown('<div class="toolbar-label" style="margin-top:4px;">Historical month-end overlays:</div>', unsafe_allow_html=True)
+        overlay_cols = st.columns(len(overlay_options))
+        for idx, option in enumerate(overlay_options):
+            with overlay_cols[idx]:
+                is_selected = st.checkbox(str(option["label"]), key=f"yield_overlay_{option['key']}")
+                if is_selected:
+                    selected_overlay_defs.append(option)
+    elif not boe_month_end_fetch_ok:
+        st.info("Historical BOE month-end curves could not be loaded, so only the latest UK curves are shown.")
+
+    historical_curve_frames = []
+    for sort_idx, option in enumerate(selected_overlay_defs, start=1):
+        curve_date = pd.Timestamp(option["curve_date"]).normalize()
+        selected_points = yield_curve_history_df[
+            pd.to_datetime(yield_curve_history_df["curve_date"], errors="coerce").dt.normalize() == curve_date
+        ][["maturity_years", "yield_percent", "curve_type", "curve_date"]].copy()
+        if selected_points.empty:
+            continue
+        selected_points["snapshot_label"] = f"{option['label']} ({curve_date.strftime('%d/%m/%Y')})"
+        selected_points["snapshot_sort"] = sort_idx
+        historical_curve_frames.append(selected_points)
+
+    historical_curve_display_df = (
+        pd.concat(historical_curve_frames, ignore_index=True)
+        if historical_curve_frames
+        else pd.DataFrame(columns=["maturity_years", "yield_percent", "curve_type", "curve_date", "snapshot_label", "snapshot_sort"])
+    )
+    yield_curve_display_df = build_yield_curve_display_df(yield_curve_df, selected_yield_series, historical_curve_display_df)
     has_curve_points = not yield_curve_display_df.empty
 
     if not boe_fetch_ok and not has_curve_points:
         st.warning("Bank of England yield-curve data could not be loaded. See diagnostics for details.")
     else:
         latest_dates = (
-            yield_curve_display_df.groupby("curve_type")["curve_date"]
+            yield_curve_df.groupby("curve_type")["curve_date"]
             .max()
             .dropna()
             .sort_index()
-        ) if has_curve_points else pd.Series(dtype="datetime64[ns]")
+        ) if not yield_curve_df.empty else pd.Series(dtype="datetime64[ns]")
         latest_text = " | ".join(
             [f"{curve}: {pd.Timestamp(curve_date).strftime('%d/%m/%Y')}" for curve, curve_date in latest_dates.items()]
         ) if not latest_dates.empty else ""
+        overlay_text = " | ".join(
+            f"{option['label']}: {pd.Timestamp(option['curve_date']).strftime('%d/%m/%Y')}" for option in selected_overlay_defs
+        ) if selected_overlay_defs else ""
+        meta_parts = []
         if latest_text:
+            meta_parts.append(f"Latest curve dates: <b>{latest_text}</b>")
+        if overlay_text:
+            meta_parts.append(f"Historical overlays: <b>{overlay_text}</b>")
+        if meta_parts:
             st.markdown(
-                f'<div class="toolbar-meta" style="text-align:left; padding-top:0; margin-bottom:10px;">Latest curve dates: <b>{latest_text}</b></div>',
+                f'<div class="toolbar-meta" style="text-align:left; padding-top:0; margin-bottom:10px;">{" | ".join(meta_parts)}</div>',
                 unsafe_allow_html=True,
             )
         if has_curve_points:
@@ -7136,10 +8145,113 @@ else:
         else:
             st.info("BOE fetch succeeded but no curve points were available to plot. See diagnostics for details.")
 
+    st.markdown('<div class="page-section-title">UK historical yield</div>', unsafe_allow_html=True)
+    uk_historical_yield_df = build_uk_historical_yield_df(yield_curve_history_df) if boe_month_end_fetch_ok else pd.DataFrame()
+    default_uk_historical_series = [
+        "Nominal 10Y",
+        "Real 10Y",
+        "BEI 10Y",
+    ]
+    available_uk_historical_series = uk_historical_yield_df["series_label"].dropna().drop_duplicates().tolist() if not uk_historical_yield_df.empty else []
+    hist_cols = st.columns([1.6, 4.4])
+    with hist_cols[0]:
+        st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+        uk_hist_period = st.segmented_control(
+            label="UK historical yield period",
+            options=UK_HISTORICAL_YIELD_PERIODS,
+            default=st.session_state.get("uk_hist_yield_period_toolbar", "MAX"),
+            key="uk_hist_yield_period_toolbar",
+            label_visibility="collapsed",
+        ) or "MAX"
+    with hist_cols[1]:
+        st.markdown('<div class="toolbar-label">Series:</div>', unsafe_allow_html=True)
+        uk_hist_series = st.multiselect(
+            "UK historical yield series",
+            options=available_uk_historical_series,
+            default=[label for label in default_uk_historical_series if label in available_uk_historical_series],
+            key="uk_hist_yield_series_toolbar",
+            label_visibility="collapsed",
+        )
+
+    if uk_historical_yield_df.empty:
+        st.info("No BOE month-end history was available for the UK historical yield chart.")
+    else:
+        uk_hist_end_date = pd.Timestamp(uk_historical_yield_df["curve_date"].max()).normalize()
+        uk_hist_min_date = pd.Timestamp(uk_historical_yield_df["curve_date"].min()).normalize()
+        uk_hist_start_date = get_uk_historical_yield_start_date(uk_hist_period, uk_hist_end_date, uk_hist_min_date)
+        uk_historical_window_df = uk_historical_yield_df[
+            (pd.to_datetime(uk_historical_yield_df["curve_date"], errors="coerce").dt.normalize() >= uk_hist_start_date)
+            & (pd.to_datetime(uk_historical_yield_df["curve_date"], errors="coerce").dt.normalize() <= uk_hist_end_date)
+        ].copy()
+        chart_series = uk_hist_series or available_uk_historical_series
+        note = (
+            f"Month-end UK nominal and real yields from <b>{uk_hist_start_date.strftime('%d/%m/%Y')}</b> to <b>{uk_hist_end_date.strftime('%d/%m/%Y')}</b>. "
+            "The shortest real and BEI line uses the earliest available BOE real-curve maturity, which is <b>2.5Y</b> in the month-end archive."
+        )
+        st.markdown(f'<div class="snapshot-toolbar-note">{note}</div>', unsafe_allow_html=True)
+        if uk_historical_window_df.empty or not chart_series:
+            st.info("No UK historical yield series were available for the selected period and filters.")
+        else:
+            st.altair_chart(build_uk_historical_yield_chart(uk_historical_window_df, chart_series, uk_hist_period), width="stretch")
+
+    st.markdown('<div class="page-section-title">UK historical term spreads</div>', unsafe_allow_html=True)
+    uk_term_spread_df = build_uk_term_spread_df(yield_curve_history_df) if boe_month_end_fetch_ok else pd.DataFrame()
+    default_uk_term_spreads = ["Nominal 10-2Y", "Nominal 2-0.5Y"]
+    available_uk_term_spreads = uk_term_spread_df["series_label"].dropna().drop_duplicates().tolist() if not uk_term_spread_df.empty else []
+    spread_cols = st.columns([1.6, 4.4])
+    with spread_cols[0]:
+        st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+        uk_term_spread_period = st.segmented_control(
+            label="UK term spread period",
+            options=UK_HISTORICAL_YIELD_PERIODS,
+            default=st.session_state.get("uk_term_spread_period_toolbar", "MAX"),
+            key="uk_term_spread_period_toolbar",
+            label_visibility="collapsed",
+        ) or "MAX"
+    with spread_cols[1]:
+        st.markdown('<div class="toolbar-label">Spreads:</div>', unsafe_allow_html=True)
+        uk_term_spread_selection = st.multiselect(
+            "UK term spread series",
+            options=available_uk_term_spreads,
+            default=[label for label in default_uk_term_spreads if label in available_uk_term_spreads],
+            key="uk_term_spread_series_toolbar",
+            label_visibility="collapsed",
+        )
+
+    if uk_term_spread_df.empty:
+        st.info("No BOE month-end history was available for the UK term-spread chart.")
+    else:
+        uk_term_end_date = pd.Timestamp(uk_term_spread_df["curve_date"].max()).normalize()
+        uk_term_min_date = pd.Timestamp(uk_term_spread_df["curve_date"].min()).normalize()
+        uk_term_start_date = get_uk_historical_yield_start_date(uk_term_spread_period, uk_term_end_date, uk_term_min_date)
+        uk_term_window_df = uk_term_spread_df[
+            (pd.to_datetime(uk_term_spread_df["curve_date"], errors="coerce").dt.normalize() >= uk_term_start_date)
+            & (pd.to_datetime(uk_term_spread_df["curve_date"], errors="coerce").dt.normalize() <= uk_term_end_date)
+        ].copy()
+        spread_series = uk_term_spread_selection or available_uk_term_spreads
+        st.markdown(
+            f'<div class="snapshot-toolbar-note">Month-end UK term spreads from <b>{uk_term_start_date.strftime("%d/%m/%Y")}</b> to <b>{uk_term_end_date.strftime("%d/%m/%Y")}</b>.</div>',
+            unsafe_allow_html=True,
+        )
+        if uk_term_window_df.empty or not spread_series:
+            st.info("No UK term-spread series were available for the selected period and filters.")
+        else:
+            st.altair_chart(build_uk_term_spread_chart(uk_term_window_df, spread_series, uk_term_spread_period), width="stretch")
+
     st.markdown('<div class="page-section-title">Global yield curves</div>', unsafe_allow_html=True)
+    global_latest_curve_date = (
+        pd.to_datetime(global_yield_curve_df["curve_date"], errors="coerce").max()
+        if not global_yield_curve_df.empty and "curve_date" in global_yield_curve_df.columns
+        else pd.NaT
+    )
+    global_latest_curve_text = (
+        pd.Timestamp(global_latest_curve_date).strftime("%d/%m/%Y")
+        if pd.notna(global_latest_curve_date)
+        else "unknown date"
+    )
     st.markdown(
         '<div class="diag-note" style="margin-top:-4px; margin-bottom:10px;">'
-        'Source: WorldGovernmentBonds. These nominal curves come from a different provider and may not match the UK curve above exactly because of source methodology, market conventions, or update timing/date differences.'
+        f'WorldGovernmentBonds nominal curves, latest dated <b>{global_latest_curve_text}</b>; methodology may differ from the UK chart above.'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -7161,20 +8273,18 @@ else:
     fx_period_options = get_fx_period_options(currency_end_date, fx_values_df)
 
     st.markdown('<div class="page-section-title">Currency performance</div>', unsafe_allow_html=True)
-    with st.container(key="performance_analysis_toolbar"):
-        st.markdown('<div class="toolbar-title">Toolbar</div>', unsafe_allow_html=True)
-        toolbar_wrap_cols = st.columns([5.1, 1.3])
-        with toolbar_wrap_cols[0]:
-            toolbar_cols = st.columns([1.55, 1.15])
-            with toolbar_cols[0]:
-                st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
-                fx_period = st.segmented_control(
-                    label="FX period",
-                    options=fx_period_options,
-                    default=st.session_state.get("rates_fx_period_toolbar", fx_period),
-                    key="rates_fx_period_toolbar",
-                    label_visibility="collapsed",
-                ) or "YTD"
+    toolbar_wrap_cols = st.columns([5.1, 1.3])
+    with toolbar_wrap_cols[0]:
+        toolbar_cols = st.columns([1.55, 1.15])
+        with toolbar_cols[0]:
+            st.markdown('<div class="toolbar-label">Period:</div>', unsafe_allow_html=True)
+            fx_period = st.segmented_control(
+                label="FX period",
+                options=fx_period_options,
+                default=st.session_state.get("rates_fx_period_toolbar", fx_period),
+                key="rates_fx_period_toolbar",
+                label_visibility="collapsed",
+            ) or "YTD"
 
     currency_matrix_df, currency_end_date = build_currency_performance_matrix(fx_values_df, fx_period)
     currency_start_text = (
@@ -7199,8 +8309,9 @@ else:
     yield_note = (
         "Latest nominal and real UK spot curves are fetched from the Bank of England yield-curve archive. "
         "The app reads the latest non-blank dated row from the '4. spot curve' sheet in the current-month nominal and real daily workbooks. "
+        "Historical UK month-end overlays are fetched from the Bank of England nominal and real month-end archives and can add last month end, last quarter end, 6M ago, 9M ago, and 1Y ago snapshots. "
         "Where DividendData provides shorter-maturity index-linked gilts than the Bank of England real curve, those short-end gilt real yields are prepended to extend the real curve only below the first BOE real maturity. "
-        "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available. "
+        "Breakeven inflation is then calculated point-by-point as ((1+nominal yield)/(1+real yield))-1 on the maturities where both nominal and real yields are available, both for the latest curve and any selected historical month-end overlays. "
         "The global chart fetches the latest nominal yield-curve tables from WorldGovernmentBonds country pages and plots the 'Last' annualised yield column for the ten largest government bond markets. "
         "The FX matrix shows daily row-versus-column currency performance from yfinance over the selected period."
     )
@@ -7550,6 +8661,23 @@ if st.session_state["show_diagnostics"]:
                 curve_preview["curve_date"] = pd.to_datetime(curve_preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
                 st.subheader("Latest BOE spot-curve points")
                 st.dataframe(prepare_dataframe_for_display(curve_preview), width="stretch", hide_index=True)
+
+            st.subheader("BOE month-end history diagnostics")
+            st.dataframe(prepare_dataframe_for_display(boe_month_end_yield_summary), width="stretch", hide_index=True)
+            if not boe_month_end_yield_preview.empty:
+                st.dataframe(prepare_dataframe_for_display(boe_month_end_yield_preview), width="stretch", hide_index=True)
+                st.download_button(
+                    label="Download BOE month-end diagnostics (CSV)",
+                    data=dataframe_to_csv_download(boe_month_end_yield_preview),
+                    file_name="boe_month_end_yield_diagnostics.csv",
+                    mime="text/csv",
+                    key="download_boe_month_end_yield_diag_csv",
+                )
+            if not yield_curve_history_df.empty:
+                history_preview = yield_curve_history_df.copy()
+                history_preview["curve_date"] = pd.to_datetime(history_preview["curve_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+                st.subheader("BOE month-end spot-curve points")
+                st.dataframe(prepare_dataframe_for_display(history_preview.tail(300)), width="stretch", hide_index=True)
 
             st.subheader("WorldGovernmentBonds diagnostics")
             st.dataframe(prepare_dataframe_for_display(global_yield_summary), width="stretch", hide_index=True)
